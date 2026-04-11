@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": true,
-      "cwd": "c:/Users/user/Documents/uni/so2/TrabalhoSO2",
-      "program": "c:/Users/user/Documents/uni/so2/TrabalhoSO2/build/Debug/outDebug",
+      "cwd": "c:/Users/diogo/Documents/uni/so2/TrabalhoSO2",
+      "program": "c:/Users/diogo/Documents/uni/so2/TrabalhoSO2/build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [

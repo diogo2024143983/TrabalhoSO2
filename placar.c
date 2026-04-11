@@ -39,6 +39,21 @@ static void ImprimirComTimestamp(CONTEXTO_APP* contexto, const TCHAR* texto) {
     LeaveCriticalSection(&contexto->csEscrita);
 }
 
+static void ImprimirAlertaComDuracao(CONTEXTO_APP* contexto, const TCHAR* msg, DWORD duracaoSeg) {
+    SYSTEMTIME tempoSistema;
+    GetLocalTime(&tempoSistema);
+
+    EnterCriticalSection(&contexto->csEscrita);
+    _tprintf(
+        _T("%02u/%02u/%04u (%02u:%02u:%02u): '%s' (%lu segundos)\n"),
+        tempoSistema.wDay, tempoSistema.wMonth, tempoSistema.wYear,
+        tempoSistema.wHour, tempoSistema.wMinute, tempoSistema.wSecond,
+        msg,
+        (unsigned long)duracaoSeg
+    );
+    LeaveCriticalSection(&contexto->csEscrita);
+}
+
 static BOOL GarantirNomePipeNoRegisto(const TCHAR* daLinhaComandos, TCHAR* nomePipeSaida, DWORD tamanhoSaida) {
     HKEY chave = NULL;
     LONG resultado;
@@ -84,7 +99,7 @@ static BOOL GarantirNomePipeNoRegisto(const TCHAR* daLinhaComandos, TCHAR* nomeP
     RegCloseKey(chave);
 
     if (resultado != ERROR_SUCCESS || tipo != REG_SZ || nomePipeSaida[0] == _T('\0')) {
-        _tprintf(_T("Erro: NPIPE nao definido na linha de comandos nem no Registry.\n"));
+        _tprintf(_T("[ERRO] O nome do 'NPIPE' nao foi especificado (args ou registry)!\n"));
         return FALSE;
     }
     return TRUE;
@@ -111,32 +126,12 @@ static BOOL LerAlertaDoRegisto(const TCHAR* nomeValor, MSG_ALERTA* alertaSaida) 
     return TRUE;
 }
 
-static DWORD EsperarDuracaoAlertaOuParar(CONTEXTO_APP* contexto, DWORD segundos) {
-    HANDLE temporizador = CreateWaitableTimer(NULL, TRUE, NULL);
-    if (temporizador == NULL) {
-        return WAIT_FAILED;
-    }
-
-    LARGE_INTEGER instanteDisparo;
-    instanteDisparo.QuadPart = -((LONGLONG)segundos * 10000000LL);
-
-    if (!SetWaitableTimer(temporizador, &instanteDisparo, 0, NULL, NULL, FALSE)) {
-        CloseHandle(temporizador);
-        return WAIT_FAILED;
-    }
-
-    HANDLE esperas[2] = { contexto->eventoParar, temporizador };
-    DWORD resultadoEspera = WaitForMultipleObjects(2, esperas, FALSE, INFINITE);
-    CloseHandle(temporizador);
-    return resultadoEspera;
-}
-
 static DWORD WINAPI ThreadAlertas(LPVOID parametro) {
     CONTEXTO_APP* contexto = (CONTEXTO_APP*)parametro;
-    HANDLE esperas[2] = { contexto->eventoParar, contexto->eventoNotificar };
+    HANDLE esperasAguardarNotificacao[2] = { contexto->eventoParar, contexto->eventoNotificar };
 
     while (InterlockedCompareExchange(&contexto->deveSair, 0, 0) == 0) {
-        DWORD resultadoEspera = WaitForMultipleObjects(2, esperas, FALSE, INFINITE);
+        DWORD resultadoEspera = WaitForMultipleObjects(2, esperasAguardarNotificacao, FALSE, INFINITE);
         if (resultadoEspera == WAIT_OBJECT_0) {
             break;
         }
@@ -148,33 +143,70 @@ static DWORD WINAPI ThreadAlertas(LPVOID parametro) {
             break;
         }
 
-        // Evento de reset manual: apos acordar, tem de voltar a nao sinalizado.
-        if (!ResetEvent(contexto->eventoNotificar)) {
-            EnterCriticalSection(&contexto->csEscrita);
-            _tprintf(_T("Aviso: falha no ResetEvent(notificar) (%lu)\n"), GetLastError());
-            LeaveCriticalSection(&contexto->csEscrita);
-            continue;
-        }
+        for (;;) {
+            if (InterlockedCompareExchange(&contexto->deveSair, 0, 0) != 0) {
+                return 0;
+            }
 
-        MSG_ALERTA alerta;
-        if (!LerAlertaDoRegisto(contexto->nomePipe, &alerta)) {
-            EnterCriticalSection(&contexto->csEscrita);
-            _tprintf(_T("Aviso: nao foi possivel ler alerta BINARY no valor '%s'.\n"), contexto->nomePipe);
-            LeaveCriticalSection(&contexto->csEscrita);
-            continue;
-        }
+            if (!ResetEvent(contexto->eventoNotificar)) {
+                EnterCriticalSection(&contexto->csEscrita);
+                _tprintf(_T("Aviso: falha no ResetEvent(notificar) (%lu)\n"), GetLastError());
+                LeaveCriticalSection(&contexto->csEscrita);
+                break;
+            }
 
-        if (alerta.tipo != 4) {
-            continue;
-        }
+            MSG_ALERTA alerta;
+            if (!LerAlertaDoRegisto(contexto->nomePipe, &alerta)) {
+                EnterCriticalSection(&contexto->csEscrita);
+                _tprintf(_T("Aviso: nao foi possivel ler alerta BINARY no valor '%s'.\n"), contexto->nomePipe);
+                LeaveCriticalSection(&contexto->csEscrita);
+                break;
+            }
 
-        ImprimirComTimestamp(contexto, alerta.msg);
-        DWORD resultadoTemporizador = EsperarDuracaoAlertaOuParar(contexto, alerta.duracao);
-        if (resultadoTemporizador == WAIT_OBJECT_0) {
+            if (alerta.tipo != 4) {
+                break;
+            }
+
+            alerta.msg[_countof(alerta.msg) - 1] = _T('\0');
+            ImprimirAlertaComDuracao(contexto, alerta.msg, alerta.duracao);
+
+            HANDLE temporizador = CreateWaitableTimer(NULL, TRUE, NULL);
+            if (temporizador == NULL) {
+                EnterCriticalSection(&contexto->csEscrita);
+                _tprintf(_T("Aviso: CreateWaitableTimer falhou (%lu)\n"), GetLastError());
+                LeaveCriticalSection(&contexto->csEscrita);
+                break;
+            }
+
+            LARGE_INTEGER instanteDisparo;
+            instanteDisparo.QuadPart = -((LONGLONG)alerta.duracao * 10000000LL);
+            if (!SetWaitableTimer(temporizador, &instanteDisparo, 0, NULL, NULL, FALSE)) {
+                CloseHandle(temporizador);
+                EnterCriticalSection(&contexto->csEscrita);
+                _tprintf(_T("Aviso: SetWaitableTimer falhou (%lu)\n"), GetLastError());
+                LeaveCriticalSection(&contexto->csEscrita);
+                break;
+            }
+
+            HANDLE esperasDuranteAlerta[3] = {
+                contexto->eventoParar,
+                contexto->eventoNotificar,
+                temporizador
+            };
+            resultadoEspera = WaitForMultipleObjects(3, esperasDuranteAlerta, FALSE, INFINITE);
+            CloseHandle(temporizador);
+
+            if (resultadoEspera == WAIT_OBJECT_0) {
+                return 0;
+            }
+            if (resultadoEspera == WAIT_OBJECT_0 + 2) {
+                ImprimirComTimestamp(contexto, _T("---"));
+                break;
+            }
+            if (resultadoEspera == WAIT_OBJECT_0 + 1) {
+                continue;
+            }
             break;
-        }
-        if (resultadoTemporizador == WAIT_OBJECT_0 + 1) {
-            ImprimirComTimestamp(contexto, _T("---"));
         }
     }
     return 0;
@@ -186,7 +218,7 @@ static DWORD WINAPI ThreadComandos(LPVOID parametro) {
 
     while (InterlockedCompareExchange(&contexto->deveSair, 0, 0) == 0) {
         EnterCriticalSection(&contexto->csEscrita);
-        _tprintf(_T("> "));
+        _tprintf(_T("CMD> "));
         LeaveCriticalSection(&contexto->csEscrita);
 
         if (_fgetts(comando, TAM_MAX_COMANDO, stdin) == NULL) {
@@ -201,7 +233,7 @@ static DWORD WINAPI ThreadComandos(LPVOID parametro) {
             comando[--tamanho] = _T('\0');
         }
 
-        if (_tcsicmp(comando, _T("ligar")) == 0) {
+        if (_tcsicmp(comando, _T("liga")) == 0) {
             if (InterlockedCompareExchange(&contexto->ligado, 0, 0) != 0) {
                 EnterCriticalSection(&contexto->csEscrita);
                 _tprintf(_T("Placar ja se encontra ligado.\n"));
@@ -214,9 +246,9 @@ static DWORD WINAPI ThreadComandos(LPVOID parametro) {
             EnterCriticalSection(&contexto->csEscrita);
             _tprintf(_T("Identificador = %lu\n"), identificador);
             LeaveCriticalSection(&contexto->csEscrita);
-        } else if (_tcsicmp(comando, _T("desligar")) == 0) {
+        } else if (_tcsicmp(comando, _T("desliga")) == 0) {
             EnterCriticalSection(&contexto->csEscrita);
-            _tprintf(_T("A desligar placar...\n"));
+            _tprintf(_T("A terminar...\n"));
             LeaveCriticalSection(&contexto->csEscrita);
 
             InterlockedExchange(&contexto->deveSair, 1);
@@ -225,7 +257,7 @@ static DWORD WINAPI ThreadComandos(LPVOID parametro) {
             break;
         } else if (comando[0] != _T('\0')) {
             EnterCriticalSection(&contexto->csEscrita);
-            _tprintf(_T("Comando invalido. Use: ligar | desligar\n"));
+            _tprintf(_T("Comando invalido. Use: liga | desliga\n"));
             LeaveCriticalSection(&contexto->csEscrita);
         }
     }
@@ -250,8 +282,7 @@ int _tmain(int argc, TCHAR* argv[]) {
     }
 
     EnterCriticalSection(&contexto.csEscrita);
-    _tprintf(_T("NamedPipe = '%s'\n"), contexto.nomePipe);
-    _tprintf(_T("Comandos disponiveis: ligar | desligar\n"));
+    _tprintf(_T("Named Pipe = '%s'\n"), contexto.nomePipe);
     LeaveCriticalSection(&contexto.csEscrita);
 
     contexto.eventoParar = CreateEvent(NULL, TRUE, FALSE, NULL);
