@@ -45,11 +45,10 @@ static void ImprimirAlertaComDuracao(CONTEXTO_APP* contexto, const TCHAR* msg, D
 
     EnterCriticalSection(&contexto->csEscrita);
     _tprintf(
-        _T("%02u/%02u/%04u (%02u:%02u:%02u): '%s' (%lu segundos)\n"),
+        _T("%02u/%02u/%04u (%02u:%02u:%02u): '%s'\n"),
         tempoSistema.wDay, tempoSistema.wMonth, tempoSistema.wYear,
         tempoSistema.wHour, tempoSistema.wMinute, tempoSistema.wSecond,
-        msg,
-        (unsigned long)duracaoSeg
+        msg
     );
     LeaveCriticalSection(&contexto->csEscrita);
 }
