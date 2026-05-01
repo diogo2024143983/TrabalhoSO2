@@ -22,7 +22,7 @@ typedef struct {
 } MSG_ALERTA;
 
 typedef struct {
-    BYTE tipo;          /* 7 - atribuir identificador */
+    BYTE  tipo;         /* 7 - atribuir identificador */
     DWORD identificador;
 } MSG_ID;
 
@@ -30,33 +30,33 @@ typedef struct {
 /* Estado de cada placar                                               */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    BOOL  ativo;
-    DWORD identificador;
-    HANDLE hPipe;           /* handle do named pipe para este placar */
-    BOOL  temAlerta;
-    TCHAR msgAlerta[140];
-    CRITICAL_SECTION csPipe; /* protege escritas/leituras no pipe deste placar */
+    BOOL   ativo;
+    DWORD  identificador;
+    HANDLE hPipe;
+    BOOL   temAlerta;
+    TCHAR  msgAlerta[140];
+    CRITICAL_SECTION csPipe;    /* protege escritas no pipe */
+    HANDLE eventoConfirmacao;   /* auto-reset: sinalizado quando chega confirmacao */
 } ESTADO_PLACAR;
 
 /* ------------------------------------------------------------------ */
-/* Contexto global da aplicação                                        */
+/* Contexto global da aplicacao                                        */
 /* ------------------------------------------------------------------ */
 typedef struct {
     TCHAR nomePipe[TAM_NOME_PIPE];
-    HANDLE hPipeServidor;       /* pipe de escuta (ConnectNamedPipe) */
 
     ESTADO_PLACAR placares[MAX_PLACARES];
     DWORD proximoId;
-    CRITICAL_SECTION csPlacares; /* protege o array de placares */
+    CRITICAL_SECTION csPlacares;
 
     volatile LONG deveSair;
-    HANDLE eventoParar;         /* sinalizado quando se quer encerrar */
+    HANDLE eventoParar;
 
-    CRITICAL_SECTION csConsola; /* protege _tprintf */
+    CRITICAL_SECTION csConsola;
 } CONTEXTO_APP;
 
 /* ------------------------------------------------------------------ */
-/* Utilitários                                                         */
+/* Utilitarios                                                         */
 /* ------------------------------------------------------------------ */
 static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
     va_list args;
@@ -67,18 +67,18 @@ static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
     va_end(args);
 }
 
-/* Devolve índice do placar com dado identificador, ou -1 */
 static int EncontrarPlacarPorId(CONTEXTO_APP* ctx, DWORD id) {
-    for (int i = 0; i < MAX_PLACARES; i++) {
+    int i;
+    for (i = 0; i < MAX_PLACARES; i++) {
         if (ctx->placares[i].ativo && ctx->placares[i].identificador == id)
             return i;
     }
     return -1;
 }
 
-/* Devolve índice de slot livre, ou -1 */
 static int EncontrarSlotLivre(CONTEXTO_APP* ctx) {
-    for (int i = 0; i < MAX_PLACARES; i++) {
+    int i;
+    for (i = 0; i < MAX_PLACARES; i++) {
         if (!ctx->placares[i].ativo)
             return i;
     }
@@ -86,43 +86,22 @@ static int EncontrarSlotLivre(CONTEXTO_APP* ctx) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Envio de mensagens ao placar (com lock do pipe individual)          */
+/* Escrita no pipe de um placar (protegida por csPipe individual)      */
 /* ------------------------------------------------------------------ */
-static BOOL EnviarMsgAlerta(CONTEXTO_APP* ctx, int idx, const MSG_ALERTA* alerta) {
+static BOOL EscreverPipePlacar(CONTEXTO_APP* ctx, int idx, const void* dados, DWORD tam) {
     DWORD escritos = 0;
     EnterCriticalSection(&ctx->placares[idx].csPipe);
-    BOOL ok = WriteFile(ctx->placares[idx].hPipe, alerta, sizeof(MSG_ALERTA), &escritos, NULL);
+    BOOL ok = WriteFile(ctx->placares[idx].hPipe, dados, tam, &escritos, NULL);
     LeaveCriticalSection(&ctx->placares[idx].csPipe);
-    return ok && escritos == sizeof(MSG_ALERTA);
-}
-
-static BOOL EnviarMsgCmd(CONTEXTO_APP* ctx, int idx, BYTE tipo) {
-    MSG_CMD cmd;
-    cmd.tipo = tipo;
-    DWORD escritos = 0;
-    EnterCriticalSection(&ctx->placares[idx].csPipe);
-    BOOL ok = WriteFile(ctx->placares[idx].hPipe, &cmd, sizeof(MSG_CMD), &escritos, NULL);
-    LeaveCriticalSection(&ctx->placares[idx].csPipe);
-    return ok && escritos == sizeof(MSG_CMD);
-}
-
-static BOOL EnviarMsgId(CONTEXTO_APP* ctx, int idx, DWORD id) {
-    MSG_ID mid;
-    mid.tipo = 7;
-    mid.identificador = id;
-    DWORD escritos = 0;
-    EnterCriticalSection(&ctx->placares[idx].csPipe);
-    BOOL ok = WriteFile(ctx->placares[idx].hPipe, &mid, sizeof(MSG_ID), &escritos, NULL);
-    LeaveCriticalSection(&ctx->placares[idx].csPipe);
-    return ok && escritos == sizeof(MSG_ID);
+    return ok && escritos == tam;
 }
 
 /* ------------------------------------------------------------------ */
-/* Thread que trata um placar ligado                                   */
+/* Thread que trata um placar ligado (unica a ler do pipe do placar)   */
 /* ------------------------------------------------------------------ */
 typedef struct {
     CONTEXTO_APP* ctx;
-    int           idx;      /* índice no array de placares */
+    int           idx;
 } ARGS_THREAD_PLACAR;
 
 static DWORD WINAPI ThreadPlacar(LPVOID param) {
@@ -132,44 +111,61 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
     free(args);
 
     HANDLE hPipe = ctx->placares[idx].hPipe;
+    BYTE buf[sizeof(MSG_ALERTA) + 32];
+    DWORD lidos;
+    BOOL ok;
+    BYTE tipo;
+    DWORD id;
 
     for (;;) {
-        /* Lê o tipo da mensagem primeiro (1 byte) */
-        BYTE tipo = 0;
-        DWORD lidos = 0;
-        BOOL ok = ReadFile(hPipe, &tipo, sizeof(BYTE), &lidos, NULL);
+        lidos = 0;
+        ok = ReadFile(hPipe, buf, sizeof(buf), &lidos, NULL);
         if (!ok || lidos == 0) {
-            /* Pipe fechado / erro — placar desligou-se abruptamente */
             PrintConsola(ctx, _T("[Central] Placar %lu desligou-se (pipe fechado).\n"),
                 ctx->placares[idx].identificador);
             break;
         }
+        tipo = buf[0];
 
         if (tipo == 1) {
             /* ligar — atribuir identificador */
             EnterCriticalSection(&ctx->csPlacares);
-            DWORD id = ctx->proximoId++;
+            id = ctx->proximoId++;
             ctx->placares[idx].identificador = id;
             LeaveCriticalSection(&ctx->csPlacares);
 
-            EnviarMsgId(ctx, idx, id);
+            /* Enviar MSG_ID de volta */
+            MSG_ID mid;
+            mid.tipo = 7;
+            mid.identificador = id;
+            EscreverPipePlacar(ctx, idx, &mid, sizeof(MSG_ID));
             PrintConsola(ctx, _T("[Central] Placar ligado com identificador %lu.\n"), id);
 
         } else if (tipo == 2) {
-            /* desligar */
-            EnviarMsgCmd(ctx, idx, 2);
+            /* desligar — enviar confirmacao e terminar */
+            MSG_CMD conf;
+            conf.tipo = 2;
+            EscreverPipePlacar(ctx, idx, &conf, sizeof(MSG_CMD));
             PrintConsola(ctx, _T("[Central] Placar %lu desligou-se.\n"),
                 ctx->placares[idx].identificador);
             break;
 
         } else if (tipo == 3) {
-            /* fim do alerta (duração expirou no placar) */
+            /* fim do alerta (duracao expirou no placar) */
             EnterCriticalSection(&ctx->csPlacares);
             ctx->placares[idx].temAlerta = FALSE;
             ctx->placares[idx].msgAlerta[0] = _T('\0');
             LeaveCriticalSection(&ctx->csPlacares);
             PrintConsola(ctx, _T("[Central] Alerta do placar %lu expirou.\n"),
                 ctx->placares[idx].identificador);
+
+        } else if (tipo == 4) {
+            /* Confirmacao de recepcao de alerta (placar envia MSG_ALERTA de volta) */
+            SetEvent(ctx->placares[idx].eventoConfirmacao);
+
+        } else if (tipo == 5) {
+            /* Confirmacao de cancelamento */
+            SetEvent(ctx->placares[idx].eventoConfirmacao);
 
         } else {
             PrintConsola(ctx, _T("[Central] Mensagem desconhecida (tipo=%u) do placar %lu.\n"),
@@ -179,10 +175,12 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
 
     /* Limpar slot */
     EnterCriticalSection(&ctx->csPlacares);
-    DeleteCriticalSection(&ctx->placares[idx].csPipe);
     CloseHandle(hPipe);
+    CloseHandle(ctx->placares[idx].eventoConfirmacao);
+    DeleteCriticalSection(&ctx->placares[idx].csPipe);
     ctx->placares[idx].ativo = FALSE;
     ctx->placares[idx].hPipe = NULL;
+    ctx->placares[idx].eventoConfirmacao = NULL;
     ctx->placares[idx].temAlerta = FALSE;
     ctx->placares[idx].msgAlerta[0] = _T('\0');
     LeaveCriticalSection(&ctx->csPlacares);
@@ -191,17 +189,22 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Thread que aceita ligações de novos placares                        */
+/* Thread que aceita ligacoes de novos placares                        */
 /* ------------------------------------------------------------------ */
 static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
-
     TCHAR nomePipeCompleto[TAM_NOME_PIPE + 10];
-    _sntprintf(nomePipeCompleto, _countof(nomePipeCompleto), _T("\\\\.\\pipe\\%s"), ctx->nomePipe);
+    HANDLE hPipe;
+    BOOL ligado;
+    int slot;
+    ARGS_THREAD_PLACAR* args;
+    HANDLE hThread;
+
+    _sntprintf(nomePipeCompleto, _countof(nomePipeCompleto),
+               _T("\\\\.\\pipe\\%s"), ctx->nomePipe);
 
     while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
-        /* Criar instância do named pipe (message mode, bidirecional) */
-        HANDLE hPipe = CreateNamedPipe(
+        hPipe = CreateNamedPipe(
             nomePipeCompleto,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
@@ -216,14 +219,10 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
             continue;
         }
 
-        /* Aguardar ligação de um cliente */
-        BOOL ligado = ConnectNamedPipe(hPipe, NULL);
+        ligado = ConnectNamedPipe(hPipe, NULL);
         if (!ligado && GetLastError() != ERROR_PIPE_CONNECTED) {
-            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) {
-                CloseHandle(hPipe);
-                break;
-            }
             CloseHandle(hPipe);
+            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
             continue;
         }
 
@@ -232,12 +231,11 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
             break;
         }
 
-        /* Encontrar slot livre */
         EnterCriticalSection(&ctx->csPlacares);
-        int slot = EncontrarSlotLivre(ctx);
+        slot = EncontrarSlotLivre(ctx);
         if (slot < 0) {
             LeaveCriticalSection(&ctx->csPlacares);
-            PrintConsola(ctx, _T("[Central] Numero maximo de placares atingido. Ligacao recusada.\n"));
+            PrintConsola(ctx, _T("[Central] Numero maximo de placares atingido.\n"));
             CloseHandle(hPipe);
             continue;
         }
@@ -247,12 +245,23 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
         ctx->placares[slot].temAlerta = FALSE;
         ctx->placares[slot].msgAlerta[0] = _T('\0');
         InitializeCriticalSection(&ctx->placares[slot].csPipe);
+        ctx->placares[slot].eventoConfirmacao = CreateEvent(NULL, FALSE, FALSE, NULL);
         LeaveCriticalSection(&ctx->csPlacares);
 
-        /* Lançar thread para tratar este placar */
-        ARGS_THREAD_PLACAR* args = (ARGS_THREAD_PLACAR*)malloc(sizeof(ARGS_THREAD_PLACAR));
+        if (ctx->placares[slot].eventoConfirmacao == NULL) {
+            EnterCriticalSection(&ctx->csPlacares);
+            DeleteCriticalSection(&ctx->placares[slot].csPipe);
+            ctx->placares[slot].ativo = FALSE;
+            ctx->placares[slot].hPipe = NULL;
+            LeaveCriticalSection(&ctx->csPlacares);
+            CloseHandle(hPipe);
+            continue;
+        }
+
+        args = (ARGS_THREAD_PLACAR*)malloc(sizeof(ARGS_THREAD_PLACAR));
         if (args == NULL) {
             EnterCriticalSection(&ctx->csPlacares);
+            CloseHandle(ctx->placares[slot].eventoConfirmacao);
             DeleteCriticalSection(&ctx->placares[slot].csPipe);
             ctx->placares[slot].ativo = FALSE;
             ctx->placares[slot].hPipe = NULL;
@@ -263,10 +272,11 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
         args->ctx = ctx;
         args->idx = slot;
 
-        HANDLE hThread = CreateThread(NULL, 0, ThreadPlacar, args, 0, NULL);
+        hThread = CreateThread(NULL, 0, ThreadPlacar, args, 0, NULL);
         if (hThread == NULL) {
             free(args);
             EnterCriticalSection(&ctx->csPlacares);
+            CloseHandle(ctx->placares[slot].eventoConfirmacao);
             DeleteCriticalSection(&ctx->placares[slot].csPipe);
             ctx->placares[slot].ativo = FALSE;
             ctx->placares[slot].hPipe = NULL;
@@ -274,73 +284,51 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
             CloseHandle(hPipe);
             continue;
         }
-        CloseHandle(hThread); /* não precisamos de esperar por ela aqui */
+        CloseHandle(hThread);
     }
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Processamento dos comandos do administrador                         */
+/* Comandos do administrador                                           */
 /* ------------------------------------------------------------------ */
 
 /* alerta <msg> <duracao> <id_placar> */
 static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
-    /* Formato: "msg" duracao id  — a mensagem pode ter espaços se entre aspas,
-       mas o enunciado não especifica aspas, por isso lemos até ao último token */
+    TCHAR copia[TAM_MAX_COMANDO];
+    TCHAR* tokens[512];
+    TCHAR* ctx_tok;
+    TCHAR* t;
+    int n, i;
+    DWORD duracao, idPlacar;
+    TCHAR msg[140];
+    MSG_ALERTA alerta;
 
-    /* Estratégia: os dois últimos tokens são duracao e id; o resto é a mensagem */
     if (args == NULL || args[0] == _T('\0')) {
         PrintConsola(ctx, _T("Uso: alerta <msg> <duracao> <id_placar>\n"));
         return;
     }
 
-    /* Encontrar os dois últimos tokens */
-    TCHAR* ultimo = NULL;
-    TCHAR* penultimo = NULL;
-    TCHAR* p = args;
-    TCHAR* tok = NULL;
-    TCHAR* ctx_tok = NULL;
-
-    /* Fazer uma cópia para tokenizar e encontrar posições */
-    TCHAR copia[TAM_MAX_COMANDO];
     _tcsncpy_s(copia, _countof(copia), args, _TRUNCATE);
+    ctx_tok = NULL;
+    n = 0;
+    t = _tcstok_s(copia, _T(" \t"), &ctx_tok);
+    while (t && n < 512) { tokens[n++] = t; t = _tcstok_s(NULL, _T(" \t"), &ctx_tok); }
 
-    /* Contar tokens */
-    int nToks = 0;
-    TCHAR* t = _tcstok_s(copia, _T(" \t"), &ctx_tok);
-    while (t) { nToks++; t = _tcstok_s(NULL, _T(" \t"), &ctx_tok); }
-
-    if (nToks < 3) {
+    if (n < 3) {
         PrintConsola(ctx, _T("Uso: alerta <msg> <duracao> <id_placar>\n"));
         return;
     }
 
-    /* Reconstruir: encontrar posição do penúltimo token no args original */
-    /* Vamos tokenizar de novo */
-    _tcsncpy_s(copia, _countof(copia), args, _TRUNCATE);
-    ctx_tok = NULL;
-    TCHAR* tokens[512];
-    int n = 0;
-    t = _tcstok_s(copia, _T(" \t"), &ctx_tok);
-    while (t && n < 512) { tokens[n++] = t; t = _tcstok_s(NULL, _T(" \t"), &ctx_tok); }
+    duracao  = (DWORD)_ttoi(tokens[n - 2]);
+    idPlacar = (DWORD)_ttoi(tokens[n - 1]);
 
-    DWORD duracao = (DWORD)_ttoi(tokens[n - 2]);
-    DWORD idPlacar = (DWORD)_ttoi(tokens[n - 1]);
-
-    /* Mensagem: tudo antes dos dois últimos tokens */
-    /* Calcular comprimento da mensagem no args original */
-    /* Posição do token n-2 no args: procurar a partir do início */
-    TCHAR msg[140];
-    ZeroMemory(msg, sizeof(msg));
-
-    /* Reconstruir mensagem juntando tokens[0..n-3] */
     msg[0] = _T('\0');
-    for (int i = 0; i < n - 2; i++) {
+    for (i = 0; i < n - 2; i++) {
         if (i > 0) _tcsncat_s(msg, _countof(msg), _T(" "), _TRUNCATE);
         _tcsncat_s(msg, _countof(msg), tokens[i], _TRUNCATE);
     }
 
-    MSG_ALERTA alerta;
     alerta.tipo = 4;
     _tcsncpy_s(alerta.msg, _countof(alerta.msg), msg, _TRUNCATE);
     alerta.duracao = duracao;
@@ -348,18 +336,18 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
     EnterCriticalSection(&ctx->csPlacares);
 
     if (idPlacar == 0) {
-        /* Enviar a todos */
-        for (int i = 0; i < MAX_PLACARES; i++) {
+        for (i = 0; i < MAX_PLACARES; i++) {
             if (!ctx->placares[i].ativo) continue;
-            if (EnviarMsgAlerta(ctx, i, &alerta)) {
-                /* Aguardar confirmação */
-                MSG_ALERTA conf;
-                DWORD lidos = 0;
-                EnterCriticalSection(&ctx->placares[i].csPipe);
-                ReadFile(ctx->placares[i].hPipe, &conf, sizeof(MSG_ALERTA), &lidos, NULL);
-                LeaveCriticalSection(&ctx->placares[i].csPipe);
-                ctx->placares[i].temAlerta = TRUE;
-                _tcsncpy_s(ctx->placares[i].msgAlerta, 140, msg, _TRUNCATE);
+            if (EscreverPipePlacar(ctx, i, &alerta, sizeof(MSG_ALERTA))) {
+                HANDLE evConf = ctx->placares[i].eventoConfirmacao;
+                LeaveCriticalSection(&ctx->csPlacares);
+                /* Aguardar confirmacao (ThreadPlacar sinaliza ao receber tipo 4) */
+                WaitForSingleObject(evConf, 5000);
+                EnterCriticalSection(&ctx->csPlacares);
+                if (ctx->placares[i].ativo) {
+                    ctx->placares[i].temAlerta = TRUE;
+                    _tcsncpy_s(ctx->placares[i].msgAlerta, 140, msg, _TRUNCATE);
+                }
             }
         }
         LeaveCriticalSection(&ctx->csPlacares);
@@ -371,31 +359,38 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
             PrintConsola(ctx, _T("[Central] Placar %lu nao encontrado.\n"), idPlacar);
             return;
         }
-        if (EnviarMsgAlerta(ctx, idx, &alerta)) {
-            /* Aguardar confirmação */
-            MSG_ALERTA conf;
-            DWORD lidos = 0;
-            EnterCriticalSection(&ctx->placares[idx].csPipe);
-            ReadFile(ctx->placares[idx].hPipe, &conf, sizeof(MSG_ALERTA), &lidos, NULL);
-            LeaveCriticalSection(&ctx->placares[idx].csPipe);
-            ctx->placares[idx].temAlerta = TRUE;
-            _tcsncpy_s(ctx->placares[idx].msgAlerta, 140, msg, _TRUNCATE);
+        HANDLE evConf = ctx->placares[idx].eventoConfirmacao;
+        if (EscreverPipePlacar(ctx, idx, &alerta, sizeof(MSG_ALERTA))) {
+            LeaveCriticalSection(&ctx->csPlacares);
+            WaitForSingleObject(evConf, 5000);
+            EnterCriticalSection(&ctx->csPlacares);
+            if (ctx->placares[idx].ativo) {
+                ctx->placares[idx].temAlerta = TRUE;
+                _tcsncpy_s(ctx->placares[idx].msgAlerta, 140, msg, _TRUNCATE);
+            }
+            LeaveCriticalSection(&ctx->csPlacares);
+        } else {
+            LeaveCriticalSection(&ctx->csPlacares);
         }
-        LeaveCriticalSection(&ctx->csPlacares);
         PrintConsola(ctx, _T("[Central] Alerta enviado ao placar %lu.\n"), idPlacar);
     }
 }
 
 /* cancelar <id_placar> */
 static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
+    DWORD idPlacar;
+    int idx;
+    HANDLE evConf;
+    MSG_CMD cmd;
+
     if (args == NULL || args[0] == _T('\0')) {
         PrintConsola(ctx, _T("Uso: cancelar <id_placar>\n"));
         return;
     }
-    DWORD idPlacar = (DWORD)_ttoi(args);
+    idPlacar = (DWORD)_ttoi(args);
 
     EnterCriticalSection(&ctx->csPlacares);
-    int idx = EncontrarPlacarPorId(ctx, idPlacar);
+    idx = EncontrarPlacarPorId(ctx, idPlacar);
     if (idx < 0) {
         LeaveCriticalSection(&ctx->csPlacares);
         PrintConsola(ctx, _T("[Central] Placar %lu nao encontrado.\n"), idPlacar);
@@ -406,53 +401,59 @@ static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
         PrintConsola(ctx, _T("[Central] Placar %lu nao tem alerta ativo.\n"), idPlacar);
         return;
     }
-    if (EnviarMsgCmd(ctx, idx, 5)) {
-        /* Aguardar confirmação */
-        MSG_CMD conf;
-        DWORD lidos = 0;
-        EnterCriticalSection(&ctx->placares[idx].csPipe);
-        ReadFile(ctx->placares[idx].hPipe, &conf, sizeof(MSG_CMD), &lidos, NULL);
-        LeaveCriticalSection(&ctx->placares[idx].csPipe);
-        ctx->placares[idx].temAlerta = FALSE;
-        ctx->placares[idx].msgAlerta[0] = _T('\0');
+    evConf = ctx->placares[idx].eventoConfirmacao;
+    cmd.tipo = 5;
+    if (EscreverPipePlacar(ctx, idx, &cmd, sizeof(MSG_CMD))) {
+        LeaveCriticalSection(&ctx->csPlacares);
+        WaitForSingleObject(evConf, 5000);
+        EnterCriticalSection(&ctx->csPlacares);
+        if (ctx->placares[idx].ativo) {
+            ctx->placares[idx].temAlerta = FALSE;
+            ctx->placares[idx].msgAlerta[0] = _T('\0');
+        }
+        LeaveCriticalSection(&ctx->csPlacares);
+    } else {
+        LeaveCriticalSection(&ctx->csPlacares);
     }
-    LeaveCriticalSection(&ctx->csPlacares);
     PrintConsola(ctx, _T("[Central] Alerta cancelado no placar %lu.\n"), idPlacar);
 }
 
 /* listar */
 static void CmdListar(CONTEXTO_APP* ctx) {
+    int i, encontrou;
     EnterCriticalSection(&ctx->csPlacares);
     PrintConsola(ctx, _T("--- Lista de placares ---\n"));
-    int encontrou = 0;
-    for (int i = 0; i < MAX_PLACARES; i++) {
+    encontrou = 0;
+    for (i = 0; i < MAX_PLACARES; i++) {
         if (!ctx->placares[i].ativo) continue;
         encontrou = 1;
         if (ctx->placares[i].temAlerta) {
             PrintConsola(ctx, _T("  Placar %lu: alerta ativo = '%s'\n"),
-                ctx->placares[i].identificador,
-                ctx->placares[i].msgAlerta);
+                ctx->placares[i].identificador, ctx->placares[i].msgAlerta);
         } else {
             PrintConsola(ctx, _T("  Placar %lu: sem alerta ativo\n"),
                 ctx->placares[i].identificador);
         }
     }
-    if (!encontrou) {
+    if (!encontrou)
         PrintConsola(ctx, _T("  (nenhum placar ligado)\n"));
-    }
     PrintConsola(ctx, _T("-------------------------\n"));
     LeaveCriticalSection(&ctx->csPlacares);
 }
 
 /* encerrar */
 static void CmdEncerrar(CONTEXTO_APP* ctx) {
+    int i;
+    MSG_CMD cmd;
+    cmd.tipo = 6;
+
     PrintConsola(ctx, _T("[Central] A encerrar a plataforma...\n"));
     InterlockedExchange(&ctx->deveSair, 1);
 
     EnterCriticalSection(&ctx->csPlacares);
-    for (int i = 0; i < MAX_PLACARES; i++) {
+    for (i = 0; i < MAX_PLACARES; i++) {
         if (!ctx->placares[i].ativo) continue;
-        EnviarMsgCmd(ctx, i, 6); /* encerrar — sem confirmação */
+        EscreverPipePlacar(ctx, i, &cmd, sizeof(MSG_CMD));
     }
     LeaveCriticalSection(&ctx->csPlacares);
 
@@ -465,6 +466,10 @@ static void CmdEncerrar(CONTEXTO_APP* ctx) {
 static DWORD WINAPI ThreadComandos(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
     TCHAR linha[TAM_MAX_COMANDO];
+    size_t len;
+    TCHAR* ctx_tok;
+    TCHAR* cmd;
+    TCHAR* restArgs;
 
     while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
         EnterCriticalSection(&ctx->csConsola);
@@ -477,20 +482,16 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
             break;
         }
 
-        /* Remover \n / \r */
-        size_t len = _tcslen(linha);
+        len = _tcslen(linha);
         while (len > 0 && (linha[len - 1] == _T('\n') || linha[len - 1] == _T('\r')))
             linha[--len] = _T('\0');
 
         if (len == 0) continue;
 
-        /* Separar comando dos argumentos */
-        TCHAR* ctx_tok = NULL;
-        TCHAR* cmd = _tcstok_s(linha, _T(" \t"), &ctx_tok);
+        ctx_tok = NULL;
+        cmd = _tcstok_s(linha, _T(" \t"), &ctx_tok);
         if (cmd == NULL) continue;
-
-        /* ctx_tok aponta para o resto da linha (argumentos) */
-        TCHAR* restArgs = ctx_tok; /* pode ser NULL ou string vazia */
+        restArgs = ctx_tok;
 
         if (_tcsicmp(cmd, _T("alerta")) == 0) {
             CmdAlerta(ctx, restArgs);
@@ -512,13 +513,16 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 int _tmain(int argc, TCHAR* argv[]) {
+    CONTEXTO_APP ctx;
+    HANDLE hThreadLigacoes, hThreadCmds;
+    int i;
+
     if (argc < 2 || argv[1] == NULL || argv[1][0] == _T('\0')) {
         _tprintf(_T("Uso: central.exe <nome_pipe>\n"));
         _tprintf(_T("Exemplo: central.exe tubo  ->  usa \\\\.\\pipe\\tubo\n"));
         return 1;
     }
 
-    CONTEXTO_APP ctx;
     ZeroMemory(&ctx, sizeof(ctx));
     _tcsncpy_s(ctx.nomePipe, _countof(ctx.nomePipe), argv[1], _TRUNCATE);
     ctx.proximoId = 1;
@@ -536,8 +540,7 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     PrintConsola(&ctx, _T("[Central] A iniciar. Named pipe: \\\\.\\pipe\\%s\n"), ctx.nomePipe);
 
-    /* Thread que aceita ligações de placares */
-    HANDLE hThreadLigacoes = CreateThread(NULL, 0, ThreadAceitarLigacoes, &ctx, 0, NULL);
+    hThreadLigacoes = CreateThread(NULL, 0, ThreadAceitarLigacoes, &ctx, 0, NULL);
     if (hThreadLigacoes == NULL) {
         _tprintf(_T("Erro: CreateThread(ligacoes) falhou (%lu)\n"), GetLastError());
         CloseHandle(ctx.eventoParar);
@@ -546,8 +549,7 @@ int _tmain(int argc, TCHAR* argv[]) {
         return 1;
     }
 
-    /* Thread de comandos do administrador */
-    HANDLE hThreadCmds = CreateThread(NULL, 0, ThreadComandos, &ctx, 0, NULL);
+    hThreadCmds = CreateThread(NULL, 0, ThreadComandos, &ctx, 0, NULL);
     if (hThreadCmds == NULL) {
         _tprintf(_T("Erro: CreateThread(comandos) falhou (%lu)\n"), GetLastError());
         InterlockedExchange(&ctx.deveSair, 1);
@@ -560,27 +562,23 @@ int _tmain(int argc, TCHAR* argv[]) {
         return 1;
     }
 
-    /* Aguardar que o administrador encerre */
     WaitForSingleObject(hThreadCmds, INFINITE);
 
-    /* Sinalizar encerramento e aguardar thread de ligações */
     InterlockedExchange(&ctx.deveSair, 1);
     SetEvent(ctx.eventoParar);
-
-    /* Fechar o pipe servidor para desbloquear ConnectNamedPipe */
-    /* A thread de ligações vai sair no próximo ciclo */
     WaitForSingleObject(hThreadLigacoes, 3000);
 
     CloseHandle(hThreadCmds);
     CloseHandle(hThreadLigacoes);
     CloseHandle(ctx.eventoParar);
 
-    /* Fechar pipes de placares ainda ligados */
     EnterCriticalSection(&ctx.csPlacares);
-    for (int i = 0; i < MAX_PLACARES; i++) {
+    for (i = 0; i < MAX_PLACARES; i++) {
         if (ctx.placares[i].ativo && ctx.placares[i].hPipe != NULL) {
             CloseHandle(ctx.placares[i].hPipe);
             ctx.placares[i].hPipe = NULL;
+            if (ctx.placares[i].eventoConfirmacao)
+                CloseHandle(ctx.placares[i].eventoConfirmacao);
             DeleteCriticalSection(&ctx.placares[i].csPipe);
         }
     }

@@ -32,34 +32,31 @@ typedef struct {
 } MSG_ID;
 
 /* ------------------------------------------------------------------ */
-/* Contexto da aplicação                                               */
+/* Contexto da aplicacao                                               */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    TCHAR  nomePipe[TAM_NOME_PIPE];     /* nome simples (sem prefixo) */
-    HANDLE hPipe;                       /* handle do named pipe ao central */
-    DWORD  identificador;               /* atribuído pelo central */
-    volatile LONG ligado;               /* 1 se ligado ao central */
-    volatile LONG deveSair;             /* 1 para terminar */
+    TCHAR  nomePipe[TAM_NOME_PIPE];
+    HANDLE hPipe;
+    DWORD  identificador;
+    volatile LONG ligado;
+    volatile LONG deveSair;
 
-    /* Alerta ativo (protegido por csAlerta) */
     volatile LONG temAlerta;
     MSG_ALERTA alertaAtivo;
 
-    /* Sincronização */
-    CRITICAL_SECTION csConsola;         /* protege _tprintf */
-    CRITICAL_SECTION csPipe;            /* protege escritas no pipe */
-    CRITICAL_SECTION csAlerta;          /* protege alertaAtivo */
+    CRITICAL_SECTION csConsola;
+    CRITICAL_SECTION csPipe;
+    CRITICAL_SECTION csAlerta;
 
-    /* Eventos */
-    HANDLE eventoParar;                 /* manual-reset: sinalizado para terminar */
-    HANDLE eventoNovoAlerta;            /* auto-reset: novo alerta recebido */
-    HANDLE eventoCancelarAlerta;        /* auto-reset: alerta cancelado pelo central */
-    HANDLE eventoRespostaLigar;         /* auto-reset: central respondeu ao ligar */
-    HANDLE eventoRespostaDesligar;      /* auto-reset: central confirmou desligar */
+    HANDLE eventoParar;
+    HANDLE eventoNovoAlerta;
+    HANDLE eventoCancelarAlerta;
+    HANDLE eventoRespostaLigar;
+    HANDLE eventoRespostaDesligar;
 } CONTEXTO_APP;
 
 /* ------------------------------------------------------------------ */
-/* Utilitários                                                         */
+/* Utilitarios                                                         */
 /* ------------------------------------------------------------------ */
 static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
     va_list args;
@@ -136,67 +133,59 @@ static BOOL EscreverPipe(CONTEXTO_APP* ctx, const void* dados, DWORD tam) {
 
 /* ------------------------------------------------------------------ */
 /* Thread que gere o temporizador do alerta ativo                      */
-/* Toda a lógica de display e temporização fica aqui.                  */
 /* ------------------------------------------------------------------ */
 static DWORD WINAPI ThreadAlertas(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
+    HANDLE espNovoAlerta[2];
+    HANDLE espDuracao[4];
+    DWORD res, resDuracao;
+    MSG_ALERTA alerta;
+    HANDLE timer;
+    LARGE_INTEGER li;
+    MSG_CMD cmd3;
+
+    espNovoAlerta[0] = ctx->eventoParar;
+    espNovoAlerta[1] = ctx->eventoNovoAlerta;
 
     for (;;) {
-        /* Aguardar novo alerta ou ordem de parar */
-        HANDLE espNovoAlerta[2] = { ctx->eventoParar, ctx->eventoNovoAlerta };
-        DWORD res = WaitForMultipleObjects(2, espNovoAlerta, FALSE, INFINITE);
+        res = WaitForMultipleObjects(2, espNovoAlerta, FALSE, INFINITE);
+        if (res == WAIT_OBJECT_0) break;
+        if (res != WAIT_OBJECT_0 + 1) continue;
 
-        if (res == WAIT_OBJECT_0) break;         /* eventoParar */
-        if (res != WAIT_OBJECT_0 + 1) continue; /* eventoNovoAlerta (auto-reset) */
-
-        /* Ler dados do alerta com lock */
         EnterCriticalSection(&ctx->csAlerta);
-        MSG_ALERTA alerta = ctx->alertaAtivo;
+        alerta = ctx->alertaAtivo;
         LeaveCriticalSection(&ctx->csAlerta);
 
         alerta.msg[_countof(alerta.msg) - 1] = _T('\0');
         ImprimirComTimestamp(ctx, alerta.msg);
 
-        /* Criar waitable timer para a duração */
-        HANDLE timer = CreateWaitableTimer(NULL, TRUE, NULL);
+        timer = CreateWaitableTimer(NULL, TRUE, NULL);
         if (timer == NULL) {
             PrintConsola(ctx, _T("Aviso: CreateWaitableTimer falhou (%lu)\n"), GetLastError());
             continue;
         }
-        LARGE_INTEGER li;
         li.QuadPart = -((LONGLONG)alerta.duracao * 10000000LL);
         SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
 
-        /* Aguardar: parar / novo alerta / cancelar / timer expirou */
-        HANDLE espDuracao[4] = {
-            ctx->eventoParar,
-            ctx->eventoNovoAlerta,
-            ctx->eventoCancelarAlerta,
-            timer
-        };
-        DWORD resDuracao = WaitForMultipleObjects(4, espDuracao, FALSE, INFINITE);
+        espDuracao[0] = ctx->eventoParar;
+        espDuracao[1] = ctx->eventoNovoAlerta;
+        espDuracao[2] = ctx->eventoCancelarAlerta;
+        espDuracao[3] = timer;
+        resDuracao = WaitForMultipleObjects(4, espDuracao, FALSE, INFINITE);
         CloseHandle(timer);
 
         if (resDuracao == WAIT_OBJECT_0) {
-            /* eventoParar */
             break;
         } else if (resDuracao == WAIT_OBJECT_0 + 1) {
-            /* Novo alerta — loop volta ao início (eventoNovoAlerta já consumido) */
-            /* Mostrar o novo alerta na próxima iteração */
-            /* Mas precisamos de o processar agora — re-sinalizar para o próximo ciclo */
-            /* Como é auto-reset e já foi consumido pelo WaitForMultipleObjects,
-               precisamos de o re-sinalizar para que o loop externo o apanhe */
+            /* Novo alerta substituiu o atual — re-sinalizar para processar */
             SetEvent(ctx->eventoNovoAlerta);
             continue;
         } else if (resDuracao == WAIT_OBJECT_0 + 2) {
-            /* Alerta cancelado pelo central */
+            /* Cancelado pelo central */
             ImprimirComTimestamp(ctx, _T("---"));
-            /* Não enviar tipo 3 — foi o central que cancelou */
         } else if (resDuracao == WAIT_OBJECT_0 + 3) {
-            /* Timer expirou — alerta terminou naturalmente */
+            /* Timer expirou */
             ImprimirComTimestamp(ctx, _T("---"));
-            /* Notificar o central: fim do alerta (tipo 3) */
-            MSG_CMD cmd3;
             cmd3.tipo = 3;
             EscreverPipe(ctx, &cmd3, sizeof(MSG_CMD));
             EnterCriticalSection(&ctx->csAlerta);
@@ -208,60 +197,54 @@ static DWORD WINAPI ThreadAlertas(LPVOID param) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Thread que recebe mensagens do central (única thread a ler do pipe) */
+/* Thread que recebe mensagens do central (unica thread a ler do pipe) */
 /* ------------------------------------------------------------------ */
 static DWORD WINAPI ThreadReceberCentral(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
-
-    /* Buffer grande o suficiente para a maior mensagem possível */
     BYTE buf[sizeof(MSG_ALERTA) + 32];
+    DWORD lidos;
+    BOOL ok;
+    BYTE tipo;
+    MSG_ALERTA* alerta;
+    MSG_ID* mid;
+    MSG_CMD conf;
 
     for (;;) {
         if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
 
-        DWORD lidos = 0;
-        /* Leitura bloqueante — sem lock pois é a única thread a ler */
-        BOOL ok = ReadFile(ctx->hPipe, buf, sizeof(buf), &lidos, NULL);
+        lidos = 0;
+        ok = ReadFile(ctx->hPipe, buf, sizeof(buf), &lidos, NULL);
 
         if (!ok || lidos == 0) {
             if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
                 PrintConsola(ctx, _T("[Placar] Ligacao ao central perdida.\n"));
                 InterlockedExchange(&ctx->deveSair, 1);
                 SetEvent(ctx->eventoParar);
-                /* Desbloquear thread de comandos se estiver à espera */
                 SetEvent(ctx->eventoRespostaLigar);
                 SetEvent(ctx->eventoRespostaDesligar);
             }
             break;
         }
 
-        BYTE tipo = buf[0];
+        tipo = buf[0];
 
         if (tipo == 4) {
-            /* Novo alerta */
             if (lidos < sizeof(MSG_ALERTA)) {
                 PrintConsola(ctx, _T("[Placar] Mensagem de alerta incompleta (%lu bytes).\n"), lidos);
                 continue;
             }
-            MSG_ALERTA* alerta = (MSG_ALERTA*)buf;
+            alerta = (MSG_ALERTA*)buf;
             alerta->msg[_countof(alerta->msg) - 1] = _T('\0');
 
-            /* Guardar alerta ativo */
             EnterCriticalSection(&ctx->csAlerta);
             ctx->alertaAtivo = *alerta;
             ctx->temAlerta = 1;
             LeaveCriticalSection(&ctx->csAlerta);
 
-            /* Confirmar receção ao central (enviar a mesma estrutura de volta) */
             EscreverPipe(ctx, alerta, sizeof(MSG_ALERTA));
-
-            /* Sinalizar thread de alertas (auto-reset) */
             SetEvent(ctx->eventoNovoAlerta);
 
         } else if (tipo == 5) {
-            /* Cancelar alerta */
-            /* Confirmar ao central */
-            MSG_CMD conf;
             conf.tipo = 5;
             EscreverPipe(ctx, &conf, sizeof(MSG_CMD));
 
@@ -269,30 +252,24 @@ static DWORD WINAPI ThreadReceberCentral(LPVOID param) {
             ctx->temAlerta = 0;
             LeaveCriticalSection(&ctx->csAlerta);
 
-            /* Sinalizar thread de alertas para cancelar o timer */
             SetEvent(ctx->eventoCancelarAlerta);
 
         } else if (tipo == 6) {
-            /* Encerrar plataforma */
             PrintConsola(ctx, _T("[Placar] Central encerrou a plataforma. A terminar...\n"));
             InterlockedExchange(&ctx->deveSair, 1);
             SetEvent(ctx->eventoParar);
-            /* Desbloquear thread de comandos se estiver à espera */
             SetEvent(ctx->eventoRespostaLigar);
             SetEvent(ctx->eventoRespostaDesligar);
             break;
 
         } else if (tipo == 7) {
-            /* Resposta ao ligar: identificador atribuído */
             if (lidos >= sizeof(MSG_ID)) {
-                MSG_ID* mid = (MSG_ID*)buf;
+                mid = (MSG_ID*)buf;
                 ctx->identificador = mid->identificador;
             }
-            /* Sinalizar thread de comandos */
             SetEvent(ctx->eventoRespostaLigar);
 
         } else if (tipo == 2) {
-            /* Confirmação de desligar */
             SetEvent(ctx->eventoRespostaDesligar);
 
         } else {
@@ -309,6 +286,11 @@ static DWORD WINAPI ThreadReceberCentral(LPVOID param) {
 static DWORD WINAPI ThreadComandos(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
     TCHAR comando[TAM_MAX_COMANDO];
+    size_t tam;
+    MSG_CMD cmd;
+    HANDLE espLigar[2];
+    HANDLE espDesligar[2];
+    DWORD res;
 
     while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
         EnterCriticalSection(&ctx->csConsola);
@@ -321,7 +303,7 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
             break;
         }
 
-        size_t tam = _tcslen(comando);
+        tam = _tcslen(comando);
         while (tam > 0 && (comando[tam - 1] == _T('\n') || comando[tam - 1] == _T('\r')))
             comando[--tam] = _T('\0');
 
@@ -333,17 +315,15 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
                 continue;
             }
 
-            /* Enviar pedido de ligar ao central (MSG_CMD tipo 1) */
-            MSG_CMD cmd;
             cmd.tipo = 1;
             if (!EscreverPipe(ctx, &cmd, sizeof(MSG_CMD))) {
                 PrintConsola(ctx, _T("[Placar] Erro ao enviar pedido de ligar ao central.\n"));
                 continue;
             }
 
-            /* Aguardar resposta da ThreadReceberCentral (evento eventoRespostaLigar) */
-            HANDLE espLigar[2] = { ctx->eventoParar, ctx->eventoRespostaLigar };
-            DWORD res = WaitForMultipleObjects(2, espLigar, FALSE, 5000);
+            espLigar[0] = ctx->eventoParar;
+            espLigar[1] = ctx->eventoRespostaLigar;
+            res = WaitForMultipleObjects(2, espLigar, FALSE, 5000);
 
             if (res != WAIT_OBJECT_0 + 1) {
                 PrintConsola(ctx, _T("[Placar] Timeout ou erro a aguardar resposta do central.\n"));
@@ -357,20 +337,17 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 
         } else if (_tcsicmp(comando, _T("desliga")) == 0) {
             if (InterlockedCompareExchange(&ctx->ligado, 0, 0) == 0) {
-                /* Não está ligado ao central — terminar diretamente */
                 PrintConsola(ctx, _T("A terminar...\n"));
                 InterlockedExchange(&ctx->deveSair, 1);
                 SetEvent(ctx->eventoParar);
                 break;
             }
 
-            /* Enviar pedido de desligar ao central (MSG_CMD tipo 2) */
-            MSG_CMD cmd;
             cmd.tipo = 2;
             EscreverPipe(ctx, &cmd, sizeof(MSG_CMD));
 
-            /* Aguardar confirmação da ThreadReceberCentral */
-            HANDLE espDesligar[2] = { ctx->eventoParar, ctx->eventoRespostaDesligar };
+            espDesligar[0] = ctx->eventoParar;
+            espDesligar[1] = ctx->eventoRespostaDesligar;
             WaitForMultipleObjects(2, espDesligar, FALSE, 5000);
 
             PrintConsola(ctx, _T("A terminar...\n"));
@@ -390,15 +367,21 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 /* ------------------------------------------------------------------ */
 int _tmain(int argc, TCHAR* argv[]) {
     CONTEXTO_APP ctx;
-    ZeroMemory(&ctx, sizeof(ctx));
+    TCHAR nomePipeCompleto[TAM_NOME_PIPE + 16];
+    BOOL ligadoPipe;
+    int tentativa;
+    DWORD err;
+    DWORD modoLeitura;
+    HANDLE hThreadCmds, hThreadAlertas, hThreadCentral;
+    HANDLE threads[3];
+    const TCHAR* argPipe;
 
+    ZeroMemory(&ctx, sizeof(ctx));
     InitializeCriticalSection(&ctx.csConsola);
     InitializeCriticalSection(&ctx.csPipe);
     InitializeCriticalSection(&ctx.csAlerta);
 
-    /* Obter nome do pipe (linha de comandos ou registry) */
-    const TCHAR* argPipe = (argc >= 2 && argv[1] != NULL && argv[1][0] != _T('\0'))
-                           ? argv[1] : NULL;
+    argPipe = (argc >= 2 && argv[1] != NULL && argv[1][0] != _T('\0')) ? argv[1] : NULL;
 
     if (!GarantirNomePipeNoRegisto(argPipe, ctx.nomePipe, _countof(ctx.nomePipe))) {
         DeleteCriticalSection(&ctx.csConsola);
@@ -409,28 +392,20 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     PrintConsola(&ctx, _T("NamedPipe = '%s'\n"), ctx.nomePipe);
 
-    /* Construir nome completo do pipe */
-    TCHAR nomePipeCompleto[TAM_NOME_PIPE + 16];
     _sntprintf(nomePipeCompleto, _countof(nomePipeCompleto),
                _T("%s%s"), PREFIXO_PIPE, ctx.nomePipe);
 
-    /* Ligar ao central via named pipe (com retry) */
     PrintConsola(&ctx, _T("[Placar] A ligar ao central em '%s'...\n"), nomePipeCompleto);
 
-    BOOL ligadoPipe = FALSE;
-    for (int tentativa = 0; tentativa < 5; tentativa++) {
-        ctx.hPipe = CreateFile(
-            nomePipeCompleto,
-            GENERIC_READ | GENERIC_WRITE,
-            0, NULL,
-            OPEN_EXISTING,
-            0, NULL
-        );
+    ligadoPipe = FALSE;
+    for (tentativa = 0; tentativa < 5; tentativa++) {
+        ctx.hPipe = CreateFile(nomePipeCompleto, GENERIC_READ | GENERIC_WRITE,
+                               0, NULL, OPEN_EXISTING, 0, NULL);
         if (ctx.hPipe != INVALID_HANDLE_VALUE) {
             ligadoPipe = TRUE;
             break;
         }
-        DWORD err = GetLastError();
+        err = GetLastError();
         if (err == ERROR_PIPE_BUSY) {
             WaitNamedPipe(nomePipeCompleto, 2000);
         } else {
@@ -448,18 +423,16 @@ int _tmain(int argc, TCHAR* argv[]) {
         return 1;
     }
 
-    /* Configurar modo message no lado cliente */
-    DWORD modoLeitura = PIPE_READMODE_MESSAGE;
+    modoLeitura = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(ctx.hPipe, &modoLeitura, NULL, NULL);
 
     PrintConsola(&ctx, _T("[Placar] Ligado ao central. Use 'liga' para registar o placar.\n"));
 
-    /* Criar eventos */
-    ctx.eventoParar           = CreateEvent(NULL, TRUE,  FALSE, NULL); /* manual-reset */
-    ctx.eventoNovoAlerta      = CreateEvent(NULL, FALSE, FALSE, NULL); /* auto-reset */
-    ctx.eventoCancelarAlerta  = CreateEvent(NULL, FALSE, FALSE, NULL); /* auto-reset */
-    ctx.eventoRespostaLigar   = CreateEvent(NULL, FALSE, FALSE, NULL); /* auto-reset */
-    ctx.eventoRespostaDesligar= CreateEvent(NULL, FALSE, FALSE, NULL); /* auto-reset */
+    ctx.eventoParar            = CreateEvent(NULL, TRUE,  FALSE, NULL);
+    ctx.eventoNovoAlerta       = CreateEvent(NULL, FALSE, FALSE, NULL);
+    ctx.eventoCancelarAlerta   = CreateEvent(NULL, FALSE, FALSE, NULL);
+    ctx.eventoRespostaLigar    = CreateEvent(NULL, FALSE, FALSE, NULL);
+    ctx.eventoRespostaDesligar = CreateEvent(NULL, FALSE, FALSE, NULL);
 
     if (!ctx.eventoParar || !ctx.eventoNovoAlerta || !ctx.eventoCancelarAlerta
         || !ctx.eventoRespostaLigar || !ctx.eventoRespostaDesligar) {
@@ -476,10 +449,9 @@ int _tmain(int argc, TCHAR* argv[]) {
         return 1;
     }
 
-    /* Criar threads */
-    HANDLE hThreadCmds    = CreateThread(NULL, 0, ThreadComandos,       &ctx, 0, NULL);
-    HANDLE hThreadAlertas = CreateThread(NULL, 0, ThreadAlertas,        &ctx, 0, NULL);
-    HANDLE hThreadCentral = CreateThread(NULL, 0, ThreadReceberCentral, &ctx, 0, NULL);
+    hThreadCmds    = CreateThread(NULL, 0, ThreadComandos,       &ctx, 0, NULL);
+    hThreadAlertas = CreateThread(NULL, 0, ThreadAlertas,        &ctx, 0, NULL);
+    hThreadCentral = CreateThread(NULL, 0, ThreadReceberCentral, &ctx, 0, NULL);
 
     if (!hThreadCmds || !hThreadAlertas || !hThreadCentral) {
         PrintConsola(&ctx, _T("Erro: falha a criar threads (%lu)\n"), GetLastError());
@@ -500,8 +472,9 @@ int _tmain(int argc, TCHAR* argv[]) {
         return 1;
     }
 
-    /* Aguardar todas as threads */
-    HANDLE threads[3] = { hThreadCmds, hThreadAlertas, hThreadCentral };
+    threads[0] = hThreadCmds;
+    threads[1] = hThreadAlertas;
+    threads[2] = hThreadCentral;
     WaitForMultipleObjects(3, threads, TRUE, INFINITE);
 
     CloseHandle(hThreadCmds);
@@ -513,3 +486,9 @@ int _tmain(int argc, TCHAR* argv[]) {
     CloseHandle(ctx.eventoRespostaLigar);
     CloseHandle(ctx.eventoRespostaDesligar);
     CloseHandle(ctx.hPipe);
+    DeleteCriticalSection(&ctx.csConsola);
+    DeleteCriticalSection(&ctx.csPipe);
+    DeleteCriticalSection(&ctx.csAlerta);
+
+    return 0;
+}
