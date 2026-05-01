@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="central/central.vcxproj" Id="ca1ecf42-aecd-45c4-85a7-362807a146fb" />
+  <Project Path="placar/placar.vcxproj" Id="b16ae6a5-1217-4925-a7ff-94d9ba00537e" />
+</Solution>
