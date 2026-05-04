@@ -3,6 +3,7 @@
 #include <tchar.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #define MAX_PLACARES    20
 #define TAM_MAX_COMANDO 512
@@ -96,6 +97,22 @@ static BOOL EscreverPipePlacar(CONTEXTO_APP* ctx, int idx, const void* dados, DW
     return ok && escritos == tam;
 }
 
+static BOOL ParseDWORDStrict(const TCHAR* texto, DWORD* valorOut) {
+    TCHAR* fim = NULL;
+    unsigned long v;
+
+    if (texto == NULL || texto[0] == _T('\0') || valorOut == NULL) return FALSE;
+
+    errno = 0;
+    v = _tcstoul(texto, &fim, 10);
+    if (fim == texto || *fim != _T('\0') || errno == ERANGE || v > 0xFFFFFFFFUL) {
+        return FALSE;
+    }
+
+    *valorOut = (DWORD)v;
+    return TRUE;
+}
+
 /* ------------------------------------------------------------------ */
 /* Thread que trata um placar ligado (unica a ler do pipe do placar)   */
 /* ------------------------------------------------------------------ */
@@ -176,11 +193,9 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
     /* Limpar slot */
     EnterCriticalSection(&ctx->csPlacares);
     CloseHandle(hPipe);
-    CloseHandle(ctx->placares[idx].eventoConfirmacao);
-    DeleteCriticalSection(&ctx->placares[idx].csPipe);
     ctx->placares[idx].ativo = FALSE;
     ctx->placares[idx].hPipe = NULL;
-    ctx->placares[idx].eventoConfirmacao = NULL;
+    ctx->placares[idx].identificador = 0;
     ctx->placares[idx].temAlerta = FALSE;
     ctx->placares[idx].msgAlerta[0] = _T('\0');
     LeaveCriticalSection(&ctx->csPlacares);
@@ -244,25 +259,12 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
         ctx->placares[slot].identificador = 0;
         ctx->placares[slot].temAlerta = FALSE;
         ctx->placares[slot].msgAlerta[0] = _T('\0');
-        InitializeCriticalSection(&ctx->placares[slot].csPipe);
-        ctx->placares[slot].eventoConfirmacao = CreateEvent(NULL, FALSE, FALSE, NULL);
+        ResetEvent(ctx->placares[slot].eventoConfirmacao);
         LeaveCriticalSection(&ctx->csPlacares);
-
-        if (ctx->placares[slot].eventoConfirmacao == NULL) {
-            EnterCriticalSection(&ctx->csPlacares);
-            DeleteCriticalSection(&ctx->placares[slot].csPipe);
-            ctx->placares[slot].ativo = FALSE;
-            ctx->placares[slot].hPipe = NULL;
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
 
         args = (ARGS_THREAD_PLACAR*)malloc(sizeof(ARGS_THREAD_PLACAR));
         if (args == NULL) {
             EnterCriticalSection(&ctx->csPlacares);
-            CloseHandle(ctx->placares[slot].eventoConfirmacao);
-            DeleteCriticalSection(&ctx->placares[slot].csPipe);
             ctx->placares[slot].ativo = FALSE;
             ctx->placares[slot].hPipe = NULL;
             LeaveCriticalSection(&ctx->csPlacares);
@@ -276,8 +278,6 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
         if (hThread == NULL) {
             free(args);
             EnterCriticalSection(&ctx->csPlacares);
-            CloseHandle(ctx->placares[slot].eventoConfirmacao);
-            DeleteCriticalSection(&ctx->placares[slot].csPipe);
             ctx->placares[slot].ativo = FALSE;
             ctx->placares[slot].hPipe = NULL;
             LeaveCriticalSection(&ctx->csPlacares);
@@ -303,6 +303,9 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
     DWORD duracao, idPlacar;
     TCHAR msg[140];
     MSG_ALERTA alerta;
+    int destinos[MAX_PLACARES];
+    HANDLE eventos[MAX_PLACARES];
+    int nDestinos = 0;
 
     if (args == NULL || args[0] == _T('\0')) {
         PrintConsola(ctx, _T("Uso: alerta <msg> <duracao> <id_placar>\n"));
@@ -320,8 +323,11 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
         return;
     }
 
-    duracao  = (DWORD)_ttoi(tokens[n - 2]);
-    idPlacar = (DWORD)_ttoi(tokens[n - 1]);
+    if (!ParseDWORDStrict(tokens[n - 2], &duracao) ||
+        !ParseDWORDStrict(tokens[n - 1], &idPlacar)) {
+        PrintConsola(ctx, _T("Erro de sintaxe: duracao e id_placar devem ser inteiros nao negativos.\n"));
+        return;
+    }
 
     msg[0] = _T('\0');
     for (i = 0; i < n - 2; i++) {
@@ -339,18 +345,22 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
         for (i = 0; i < MAX_PLACARES; i++) {
             if (!ctx->placares[i].ativo) continue;
             if (EscreverPipePlacar(ctx, i, &alerta, sizeof(MSG_ALERTA))) {
-                HANDLE evConf = ctx->placares[i].eventoConfirmacao;
-                LeaveCriticalSection(&ctx->csPlacares);
-                /* Aguardar confirmacao (ThreadPlacar sinaliza ao receber tipo 4) */
-                WaitForSingleObject(evConf, 5000);
-                EnterCriticalSection(&ctx->csPlacares);
-                if (ctx->placares[i].ativo) {
-                    ctx->placares[i].temAlerta = TRUE;
-                    _tcsncpy_s(ctx->placares[i].msgAlerta, 140, msg, _TRUNCATE);
-                }
+                destinos[nDestinos] = i;
+                eventos[nDestinos] = ctx->placares[i].eventoConfirmacao;
+                nDestinos++;
             }
         }
         LeaveCriticalSection(&ctx->csPlacares);
+
+        for (i = 0; i < nDestinos; i++) {
+            WaitForSingleObject(eventos[i], 5000);
+            EnterCriticalSection(&ctx->csPlacares);
+            if (ctx->placares[destinos[i]].ativo) {
+                ctx->placares[destinos[i]].temAlerta = TRUE;
+                _tcsncpy_s(ctx->placares[destinos[i]].msgAlerta, 140, msg, _TRUNCATE);
+            }
+            LeaveCriticalSection(&ctx->csPlacares);
+        }
         PrintConsola(ctx, _T("[Central] Alerta enviado a todos os placares.\n"));
     } else {
         int idx = EncontrarPlacarPorId(ctx, idPlacar);
@@ -387,7 +397,10 @@ static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
         PrintConsola(ctx, _T("Uso: cancelar <id_placar>\n"));
         return;
     }
-    idPlacar = (DWORD)_ttoi(args);
+    if (!ParseDWORDStrict(args, &idPlacar)) {
+        PrintConsola(ctx, _T("Erro de sintaxe: id_placar deve ser inteiro nao negativo.\n"));
+        return;
+    }
 
     EnterCriticalSection(&ctx->csPlacares);
     idx = EncontrarPlacarPorId(ctx, idPlacar);
@@ -529,10 +542,28 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     InitializeCriticalSection(&ctx.csPlacares);
     InitializeCriticalSection(&ctx.csConsola);
+    for (i = 0; i < MAX_PLACARES; i++) {
+        InitializeCriticalSection(&ctx.placares[i].csPipe);
+        ctx.placares[i].eventoConfirmacao = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (ctx.placares[i].eventoConfirmacao == NULL) {
+            _tprintf(_T("Erro: CreateEvent(eventoConfirmacao) falhou (%lu)\n"), GetLastError());
+            while (--i >= 0) {
+                CloseHandle(ctx.placares[i].eventoConfirmacao);
+                DeleteCriticalSection(&ctx.placares[i].csPipe);
+            }
+            DeleteCriticalSection(&ctx.csPlacares);
+            DeleteCriticalSection(&ctx.csConsola);
+            return 1;
+        }
+    }
 
     ctx.eventoParar = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (ctx.eventoParar == NULL) {
         _tprintf(_T("Erro: CreateEvent falhou (%lu)\n"), GetLastError());
+        for (i = 0; i < MAX_PLACARES; i++) {
+            CloseHandle(ctx.placares[i].eventoConfirmacao);
+            DeleteCriticalSection(&ctx.placares[i].csPipe);
+        }
         DeleteCriticalSection(&ctx.csPlacares);
         DeleteCriticalSection(&ctx.csConsola);
         return 1;
@@ -544,6 +575,10 @@ int _tmain(int argc, TCHAR* argv[]) {
     if (hThreadLigacoes == NULL) {
         _tprintf(_T("Erro: CreateThread(ligacoes) falhou (%lu)\n"), GetLastError());
         CloseHandle(ctx.eventoParar);
+        for (i = 0; i < MAX_PLACARES; i++) {
+            CloseHandle(ctx.placares[i].eventoConfirmacao);
+            DeleteCriticalSection(&ctx.placares[i].csPipe);
+        }
         DeleteCriticalSection(&ctx.csPlacares);
         DeleteCriticalSection(&ctx.csConsola);
         return 1;
@@ -557,6 +592,10 @@ int _tmain(int argc, TCHAR* argv[]) {
         WaitForSingleObject(hThreadLigacoes, 3000);
         CloseHandle(hThreadLigacoes);
         CloseHandle(ctx.eventoParar);
+        for (i = 0; i < MAX_PLACARES; i++) {
+            CloseHandle(ctx.placares[i].eventoConfirmacao);
+            DeleteCriticalSection(&ctx.placares[i].csPipe);
+        }
         DeleteCriticalSection(&ctx.csPlacares);
         DeleteCriticalSection(&ctx.csConsola);
         return 1;
@@ -577,16 +616,15 @@ int _tmain(int argc, TCHAR* argv[]) {
         if (ctx.placares[i].ativo && ctx.placares[i].hPipe != NULL) {
             CloseHandle(ctx.placares[i].hPipe);
             ctx.placares[i].hPipe = NULL;
-            if (ctx.placares[i].eventoConfirmacao)
-                CloseHandle(ctx.placares[i].eventoConfirmacao);
-            DeleteCriticalSection(&ctx.placares[i].csPipe);
         }
+        if (ctx.placares[i].eventoConfirmacao)
+            CloseHandle(ctx.placares[i].eventoConfirmacao);
+        DeleteCriticalSection(&ctx.placares[i].csPipe);
     }
     LeaveCriticalSection(&ctx.csPlacares);
 
+    PrintConsola(&ctx, _T("[Central] Encerrado.\n"));
     DeleteCriticalSection(&ctx.csPlacares);
     DeleteCriticalSection(&ctx.csConsola);
-
-    PrintConsola(&ctx, _T("[Central] Encerrado.\n"));
     return 0;
 }

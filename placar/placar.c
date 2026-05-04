@@ -53,6 +53,7 @@ typedef struct {
     HANDLE eventoCancelarAlerta;
     HANDLE eventoRespostaLigar;
     HANDLE eventoRespostaDesligar;
+    volatile LONG esperandoInput;
 } CONTEXTO_APP;
 
 /* ------------------------------------------------------------------ */
@@ -62,7 +63,12 @@ static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     EnterCriticalSection(&ctx->csConsola);
+    _tprintf(_T("\r%*s\r"), 120, _T(""));
     _vtprintf(fmt, args);
+    if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0 &&
+        InterlockedCompareExchange(&ctx->esperandoInput, 0, 0) != 0) {
+        _tprintf(_T("CMD> "));
+    }
     LeaveCriticalSection(&ctx->csConsola);
     va_end(args);
 }
@@ -71,10 +77,15 @@ static void ImprimirComTimestamp(CONTEXTO_APP* ctx, const TCHAR* texto) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     EnterCriticalSection(&ctx->csConsola);
+    _tprintf(_T("\r%*s\r"), 120, _T(""));
     _tprintf(_T("%02u/%02u/%04u (%02u:%02u:%02u): '%s'\n"),
         st.wDay, st.wMonth, st.wYear,
         st.wHour, st.wMinute, st.wSecond,
         texto);
+    if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0 &&
+        InterlockedCompareExchange(&ctx->esperandoInput, 0, 0) != 0) {
+        _tprintf(_T("CMD> "));
+    }
     LeaveCriticalSection(&ctx->csConsola);
 }
 
@@ -138,17 +149,23 @@ static DWORD WINAPI ThreadAlertas(LPVOID param) {
     CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
     HANDLE espNovoAlerta[2];
     HANDLE espDuracao[4];
-    DWORD res, resDuracao;
+    DWORD resDuracao;
     MSG_ALERTA alerta;
     HANDLE timer;
     LARGE_INTEGER li;
     MSG_CMD cmd3;
 
+    timer = CreateWaitableTimer(NULL, TRUE, NULL);
+    if (timer == NULL) {
+        PrintConsola(ctx, _T("Erro: CreateWaitableTimer falhou (%lu)\n"), GetLastError());
+        return 1;
+    }
+
     espNovoAlerta[0] = ctx->eventoParar;
     espNovoAlerta[1] = ctx->eventoNovoAlerta;
 
     for (;;) {
-        res = WaitForMultipleObjects(2, espNovoAlerta, FALSE, INFINITE);
+        DWORD res = WaitForMultipleObjects(2, espNovoAlerta, FALSE, INFINITE);
         if (res == WAIT_OBJECT_0) break;
         if (res != WAIT_OBJECT_0 + 1) continue;
 
@@ -159,40 +176,46 @@ static DWORD WINAPI ThreadAlertas(LPVOID param) {
         alerta.msg[_countof(alerta.msg) - 1] = _T('\0');
         ImprimirComTimestamp(ctx, alerta.msg);
 
-        timer = CreateWaitableTimer(NULL, TRUE, NULL);
-        if (timer == NULL) {
-            PrintConsola(ctx, _T("Aviso: CreateWaitableTimer falhou (%lu)\n"), GetLastError());
+        li.QuadPart = -((LONGLONG)alerta.duracao * 10000000LL);
+        if (!SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE)) {
+            PrintConsola(ctx, _T("Aviso: SetWaitableTimer falhou (%lu)\n"), GetLastError());
             continue;
         }
-        li.QuadPart = -((LONGLONG)alerta.duracao * 10000000LL);
-        SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
 
         espDuracao[0] = ctx->eventoParar;
         espDuracao[1] = ctx->eventoNovoAlerta;
         espDuracao[2] = ctx->eventoCancelarAlerta;
         espDuracao[3] = timer;
-        resDuracao = WaitForMultipleObjects(4, espDuracao, FALSE, INFINITE);
-        CloseHandle(timer);
 
-        if (resDuracao == WAIT_OBJECT_0) {
-            break;
-        } else if (resDuracao == WAIT_OBJECT_0 + 1) {
-            /* Novo alerta substituiu o atual — re-sinalizar para processar */
-            SetEvent(ctx->eventoNovoAlerta);
-            continue;
-        } else if (resDuracao == WAIT_OBJECT_0 + 2) {
-            /* Cancelado pelo central */
-            ImprimirComTimestamp(ctx, _T("---"));
-        } else if (resDuracao == WAIT_OBJECT_0 + 3) {
-            /* Timer expirou */
-            ImprimirComTimestamp(ctx, _T("---"));
-            cmd3.tipo = 3;
-            EscreverPipe(ctx, &cmd3, sizeof(MSG_CMD));
-            EnterCriticalSection(&ctx->csAlerta);
-            ctx->temAlerta = 0;
-            LeaveCriticalSection(&ctx->csAlerta);
+        for (;;) {
+            resDuracao = WaitForMultipleObjects(4, espDuracao, FALSE, INFINITE);
+            if (resDuracao == WAIT_OBJECT_0) {
+                CloseHandle(timer);
+                return 0;
+            } else if (resDuracao == WAIT_OBJECT_0 + 1) {
+                EnterCriticalSection(&ctx->csAlerta);
+                alerta = ctx->alertaAtivo;
+                LeaveCriticalSection(&ctx->csAlerta);
+                alerta.msg[_countof(alerta.msg) - 1] = _T('\0');
+                ImprimirComTimestamp(ctx, alerta.msg);
+                li.QuadPart = -((LONGLONG)alerta.duracao * 10000000LL);
+                SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
+            } else if (resDuracao == WAIT_OBJECT_0 + 2) {
+                CancelWaitableTimer(timer);
+                ImprimirComTimestamp(ctx, _T("---"));
+                break;
+            } else if (resDuracao == WAIT_OBJECT_0 + 3) {
+                ImprimirComTimestamp(ctx, _T("---"));
+                cmd3.tipo = 3;
+                EscreverPipe(ctx, &cmd3, sizeof(MSG_CMD));
+                EnterCriticalSection(&ctx->csAlerta);
+                ctx->temAlerta = 0;
+                LeaveCriticalSection(&ctx->csAlerta);
+                break;
+            }
         }
     }
+    CloseHandle(timer);
     return 0;
 }
 
@@ -260,7 +283,7 @@ static DWORD WINAPI ThreadReceberCentral(LPVOID param) {
             SetEvent(ctx->eventoParar);
             SetEvent(ctx->eventoRespostaLigar);
             SetEvent(ctx->eventoRespostaDesligar);
-            break;
+            ExitProcess(0);
 
         } else if (tipo == 7) {
             if (lidos >= sizeof(MSG_ID)) {
@@ -296,12 +319,15 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
         EnterCriticalSection(&ctx->csConsola);
         _tprintf(_T("CMD> "));
         LeaveCriticalSection(&ctx->csConsola);
+        InterlockedExchange(&ctx->esperandoInput, 1);
 
         if (_fgetts(comando, TAM_MAX_COMANDO, stdin) == NULL) {
+            InterlockedExchange(&ctx->esperandoInput, 0);
             InterlockedExchange(&ctx->deveSair, 1);
             SetEvent(ctx->eventoParar);
             break;
         }
+        InterlockedExchange(&ctx->esperandoInput, 0);
 
         tam = _tcslen(comando);
         while (tam > 0 && (comando[tam - 1] == _T('\n') || comando[tam - 1] == _T('\r')))
