@@ -75,6 +75,9 @@
   <ItemGroup>
     <ClCompile Include="central.c" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\protocolo.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
