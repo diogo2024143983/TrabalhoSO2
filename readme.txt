@@ -40,8 +40,8 @@ Utilizacao
        placar.exe
 
   3. No placar, escrever:
-       liga      -> regista o placar no central e recebe o identificador
-       desliga   -> remove o placar da plataforma e termina
+       ligar     -> regista o placar no central e recebe o identificador
+       desligar  -> remove o placar da plataforma e termina
 
   4. No central, escrever:
        alerta <msg> <duracao_seg> <id_placar>
@@ -66,8 +66,8 @@ Central:
   [x] 4. Mantem estado dos placares, alertas ativos e identificadores
 
 Placar (alteracoes M2):
-  [x] 5. Comando "liga": envia MSG_CMD (tipo=1), recebe MSG_ID (tipo=7), mostra identificador
-  [x] 6. Comando "desliga": envia MSG_CMD (tipo=2), recebe confirmacao, termina
+  [x] 5. Comando "ligar": envia MSG_CMD (tipo=1), recebe MSG_ID (tipo=7), mostra identificador
+  [x] 6. Comando "desligar": envia MSG_CMD (tipo=2), recebe confirmacao, termina
   [x] 7. Timer expirado: envia MSG_CMD (tipo=3) ao central
   [x] 8. Recebe MSG_ALERTA (tipo=4): confirma com mesma estrutura, mostra na consola com timestamp
   [x] 9. Recebe MSG_CMD (tipo=5): confirma, mostra "---" com timestamp
