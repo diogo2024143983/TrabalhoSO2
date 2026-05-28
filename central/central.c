@@ -3,11 +3,17 @@
 #include <tchar.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <errno.h>
 #include "../protocolo.h"
 
 #define TAM_MAX_COMANDO 512
 #define TAM_NOME_PIPE   256
+
+// Nomes dos objetos de sincronizacao/memoria partilhada para o monitor
+#define SHM_NAME        _T("Global\\TrabSO2_ShmAlerta")
+#define EVT_UPDATE_NAME _T("Global\\TrabSO2_EvtUpdate")
+#define MUTEX_SHM_NAME  _T("Global\\TrabSO2_MutexShm")
 
 typedef struct {
     BOOL   ativo;
@@ -27,6 +33,12 @@ typedef struct {
     volatile LONG deveSair;
     HANDLE eventoParar;
     CRITICAL_SECTION csConsola;
+
+    // Memoria partilhada para o monitor
+    HANDLE hMapFile;
+    SHM_ALERTA* shm;
+    HANDLE hEvtUpdate;
+    HANDLE hMutexShm;
 } CONTEXTO_APP;
 
 static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
@@ -80,6 +92,28 @@ static BOOL ParseDWORDStrict(const TCHAR* texto, DWORD* valorOut) {
     return TRUE;
 }
 
+// Atualiza a memoria partilhada com o estado atual dos placares
+static void AtualizarShm(CONTEXTO_APP* ctx) {
+    int i;
+
+    WaitForSingleObject(ctx->hMutexShm, INFINITE);
+
+    ZeroMemory(ctx->shm, sizeof(SHM_ALERTA));
+    for (i = 0; i < MAX_PLACAR; i++) {
+        if (ctx->placares[i].ativo && ctx->placares[i].temAlerta) {
+            ctx->shm->placar[i].identificador = ctx->placares[i].identificador;
+            ctx->shm->placar[i].duracao = 0; // A duracao atual restante nao e mantida no central
+            _tcsncpy_s(ctx->shm->placar[i].msg, TAM_MSG, ctx->placares[i].msgAlerta, _TRUNCATE);
+        }
+    }
+    ctx->shm->desligar = FALSE;
+
+    ReleaseMutex(ctx->hMutexShm);
+
+    // Notifica os monitores que houve alteracao
+    SetEvent(ctx->hEvtUpdate);
+}
+
 typedef struct {
     CONTEXTO_APP* ctx;
     int           idx;
@@ -119,6 +153,8 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
             EscreverPipePlacar(ctx, idx, &mid, sizeof(MSG_ID));
             PrintConsola(ctx, _T("[Central] Placar ligado com identificador %lu.\n"), id);
 
+            AtualizarShm(ctx);
+
         }
         else if (tipo == TIPO_DESLIGAR) {
             MSG_CMD conf;
@@ -134,6 +170,8 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
             ctx->placares[idx].msgAlerta[0] = _T('\0');
             LeaveCriticalSection(&ctx->csPlacares);
             PrintConsola(ctx, _T("[Central] Alerta do placar %lu expirou.\n"), ctx->placares[idx].identificador);
+
+            AtualizarShm(ctx);
 
         }
         else if (tipo == TIPO_NOVO_ALERTA) {
@@ -157,6 +195,8 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
     ctx->placares[idx].temAlerta = FALSE;
     ctx->placares[idx].msgAlerta[0] = _T('\0');
     LeaveCriticalSection(&ctx->csPlacares);
+
+    AtualizarShm(ctx);
 
     return 0;
 }
@@ -320,6 +360,8 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
             LeaveCriticalSection(&ctx->csPlacares);
         }
     }
+
+    AtualizarShm(ctx);
 }
 
 static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
@@ -353,6 +395,8 @@ static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
     else {
         LeaveCriticalSection(&ctx->csPlacares);
     }
+
+    AtualizarShm(ctx);
 }
 
 static void CmdListar(CONTEXTO_APP* ctx) {
@@ -388,6 +432,14 @@ static void CmdEncerrar(CONTEXTO_APP* ctx) {
         EscreverPipePlacar(ctx, i, &cmd, sizeof(MSG_CMD));
     }
     LeaveCriticalSection(&ctx->csPlacares);
+
+    // Sinaliza desligamento na SHM para os monitores
+    if (ctx->shm != NULL) {
+        WaitForSingleObject(ctx->hMutexShm, INFINITE);
+        ctx->shm->desligar = TRUE;
+        ReleaseMutex(ctx->hMutexShm);
+        SetEvent(ctx->hEvtUpdate);
+    }
 
     SetEvent(ctx->eventoParar);
 }
@@ -452,6 +504,31 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     InitializeCriticalSection(&ctx.csPlacares);
     InitializeCriticalSection(&ctx.csConsola);
+
+    PrintConsola(&ctx, _T("Named Pipe = '%s'\n"), ctx.nomePipe);
+
+    // Criar memoria partilhada para o monitor
+    ctx.hMapFile = CreateFileMapping(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        sizeof(SHM_ALERTA),
+        SHM_NAME
+    );
+    if (ctx.hMapFile != NULL) {
+        ctx.shm = (SHM_ALERTA*)MapViewOfFile(ctx.hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SHM_ALERTA));
+        if (ctx.shm != NULL) {
+            ZeroMemory(ctx.shm, sizeof(SHM_ALERTA));
+        }
+    }
+
+    // Criar evento de notificacao para os monitores
+    ctx.hEvtUpdate = CreateEvent(NULL, TRUE, FALSE, EVT_UPDATE_NAME);
+
+    // Criar mutex para proteger a SHM
+    ctx.hMutexShm = CreateMutex(NULL, FALSE, MUTEX_SHM_NAME);
+
     for (i = 0; i < MAX_PLACAR; i++) {
         InitializeCriticalSection(&ctx.placares[i].csPipe);
         ctx.placares[i].eventoConfirmacao = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -501,6 +578,12 @@ int _tmain(int argc, TCHAR* argv[]) {
         DeleteCriticalSection(&ctx.placares[i].csPipe);
     }
     LeaveCriticalSection(&ctx.csPlacares);
+
+    // Limpeza dos recursos de monitor
+    if (ctx.shm != NULL) UnmapViewOfFile(ctx.shm);
+    if (ctx.hMapFile != NULL) CloseHandle(ctx.hMapFile);
+    if (ctx.hEvtUpdate != NULL) CloseHandle(ctx.hEvtUpdate);
+    if (ctx.hMutexShm != NULL) CloseHandle(ctx.hMutexShm);
 
     DeleteCriticalSection(&ctx.csPlacares);
     DeleteCriticalSection(&ctx.csConsola);

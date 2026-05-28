@@ -1,599 +1,83 @@
-#define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <tchar.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <errno.h>
-#include "../protocolo.h"
-
-#define TAM_MAX_COMANDO 512
-#define TAM_NOME_PIPE   256
-
-typedef struct {
-    BOOL   ativo;
-    DWORD  identificador;
-    HANDLE hPipe;
-    BOOL   temAlerta;
-    TCHAR  msgAlerta[TAM_MSG];
-    CRITICAL_SECTION csPipe;
-    HANDLE eventoConfirmacao;
-} ESTADO_PLACAR;
-
-typedef struct {
-    TCHAR nomePipe[TAM_NOME_PIPE];
-    ESTADO_PLACAR placares[MAX_PLACAR];
-    DWORD proximoId;
-    CRITICAL_SECTION csPlacares;
-    volatile LONG deveSair;
-    HANDLE eventoParar;
-    CRITICAL_SECTION csConsola;
-} CONTEXTO_APP;
-
-static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    EnterCriticalSection(&ctx->csConsola);
-    _vtprintf(fmt, args);
-    LeaveCriticalSection(&ctx->csConsola);
-    va_end(args);
-}
-
-static const TCHAR* NomeTipoRecebido(BYTE tipo) {
-    switch (tipo) {
-    case TIPO_RESPOSTA_ID: return _T("MSG_ID");
-    case TIPO_NOVO_ALERTA: return _T("MSG_ALERTA");
-    default: return _T("MSG_CMD");
-    }
-}
-
-static const TCHAR* NomeTipoEnviado(BYTE tipo) {
-    switch (tipo) {
-    case TIPO_RESPOSTA_ID: return _T("MSG_ID");
-    case TIPO_NOVO_ALERTA: return _T("MSG_ALERTA");
-    default: return _T("MSG_CMD");
-    }
-}
-
-static int EncontrarPlacarPorId(CONTEXTO_APP* ctx, DWORD id) {
-    int i;
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (ctx->placares[i].ativo && ctx->placares[i].identificador == id)
-            return i;
-    }
-    return -1;
-}
-
-static int EncontrarSlotLivre(CONTEXTO_APP* ctx) {
-    int i;
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (!ctx->placares[i].ativo)
-            return i;
-    }
-    return -1;
-}
-
-static BOOL EscreverPipePlacar(CONTEXTO_APP* ctx, int idx, const void* dados, DWORD tam) {
-    DWORD escritos = 0;
-    EnterCriticalSection(&ctx->placares[idx].csPipe);
-    BOOL ok = WriteFile(ctx->placares[idx].hPipe, dados, tam, &escritos, NULL);
-    LeaveCriticalSection(&ctx->placares[idx].csPipe);
-    return ok && escritos == tam;
-}
-
-static BOOL ParseDWORDStrict(const TCHAR* texto, DWORD* valorOut) {
-    TCHAR* fim = NULL;
-    unsigned long v;
-
-    if (texto == NULL || texto[0] == _T('\0') || valorOut == NULL) return FALSE;
-
-    errno = 0;
-    v = _tcstoul(texto, &fim, 10);
-    if (fim == texto || *fim != _T('\0') || errno == ERANGE || v > 0xFFFFFFFFUL) {
-        return FALSE;
-    }
-
-    *valorOut = (DWORD)v;
-    return TRUE;
-}
-
-typedef struct {
-    CONTEXTO_APP* ctx;
-    int           idx;
-} ARGS_THREAD_PLACAR;
-
-static DWORD WINAPI ThreadPlacar(LPVOID param) {
-    ARGS_THREAD_PLACAR* args = (ARGS_THREAD_PLACAR*)param;
-    CONTEXTO_APP* ctx = args->ctx;
-    int idx = args->idx;
-    free(args);
-
-    HANDLE hPipe = ctx->placares[idx].hPipe;
-    BYTE buf[sizeof(MSG_ALERTA) + 32];
-    DWORD lidos;
-    BOOL ok;
-    BYTE tipo;
-    DWORD id;
-
-    for (;;) {
-        DWORD bytesDisp = 0;
-        if (!PeekNamedPipe(hPipe, NULL, 0, NULL, &bytesDisp, NULL)) {
-            PrintConsola(ctx, _T("[Central] Placar %lu desligou-se.\n"), ctx->placares[idx].identificador);
-            break;
-        }
-        if (bytesDisp == 0) {
-            Sleep(50);
-            continue;
-        }
-
-        lidos = 0;
-        ok = ReadFile(hPipe, buf, sizeof(buf), &lidos, NULL);
-        if (!ok || lidos == 0) break;
-
-        tipo = buf[0];
-
-        {
-            DWORD numPlacarDbg;
-            if (tipo == TIPO_LIGAR) {
-                EnterCriticalSection(&ctx->csPlacares);
-                numPlacarDbg = ctx->proximoId;
-                LeaveCriticalSection(&ctx->csPlacares);
-            }
-            else {
-                numPlacarDbg = ctx->placares[idx].identificador;
-            }
-            PrintConsola(ctx, _T("[DEBUG] Recebi %lu %s do placar %lu... %s (tipo = %u)\n"),
-                (unsigned long)lidos,
-                lidos == 1 ? _T("byte") : _T("bytes"),
-                (unsigned long)numPlacarDbg,
-                NomeTipoRecebido(tipo),
-                (unsigned)tipo);
-        }
-
-        if (tipo == TIPO_LIGAR) {
-            EnterCriticalSection(&ctx->csPlacares);
-            id = ctx->proximoId++;
-            ctx->placares[idx].identificador = id;
-            LeaveCriticalSection(&ctx->csPlacares);
-
-            PrintConsola(ctx, _T("[DEBUG] Atribui o identificador %lu...\n"), id);
-
-            MSG_ID mid;
-            mid.tipo = TIPO_RESPOSTA_ID;
-            mid.identificador = id;
-            EscreverPipePlacar(ctx, idx, &mid, sizeof(MSG_ID));
-            PrintConsola(ctx, _T("[DEBUG] Enviei %lu bytes ao placar %lu... %s (tipo = %u)\n"),
-                (unsigned long)sizeof(MSG_ID), id, NomeTipoEnviado(TIPO_RESPOSTA_ID), (unsigned)TIPO_RESPOSTA_ID);
-            PrintConsola(ctx, _T("[Central] Placar ligado com identificador %lu.\n"), id);
-
-        }
-        else if (tipo == TIPO_DESLIGAR) {
-            id = ctx->placares[idx].identificador;
-            MSG_CMD conf;
-            conf.tipo = TIPO_DESLIGAR;
-            EscreverPipePlacar(ctx, idx, &conf, sizeof(MSG_CMD));
-            PrintConsola(ctx, _T("[DEBUG] Enviei %lu %s ao placar %lu... %s (tipo = %u)\n"),
-                (unsigned long)sizeof(MSG_CMD),
-                sizeof(MSG_CMD) == 1 ? _T("byte") : _T("bytes"),
-                id,
-                NomeTipoEnviado(TIPO_DESLIGAR),
-                (unsigned)TIPO_DESLIGAR);
-            PrintConsola(ctx, _T("[DEBUG] Desliguei/removi o placar %lu...\n"), id);
-            PrintConsola(ctx, _T("[Central] Placar %lu desligou-se.\n"), id);
-            break;
-
-        }
-        else if (tipo == TIPO_FIM_ALERTA) {
-            EnterCriticalSection(&ctx->csPlacares);
-            ctx->placares[idx].temAlerta = FALSE;
-            ctx->placares[idx].msgAlerta[0] = _T('\0');
-            LeaveCriticalSection(&ctx->csPlacares);
-            PrintConsola(ctx, _T("[DEBUG] Duracao do alerta do placar %lu terminou...\n"), ctx->placares[idx].identificador);
-            PrintConsola(ctx, _T("[Central] Alerta do placar %lu expirou.\n"), ctx->placares[idx].identificador);
-
-        }
-        else if (tipo == TIPO_NOVO_ALERTA) {
-            SetEvent(ctx->placares[idx].eventoConfirmacao);
-
-        }
-        else if (tipo == TIPO_CANCELAR) {
-            SetEvent(ctx->placares[idx].eventoConfirmacao);
-
-        }
-        else {
-            PrintConsola(ctx, _T("[Central] Mensagem desconhecida do placar %lu.\n"), ctx->placares[idx].identificador);
-        }
-    }
-
-    EnterCriticalSection(&ctx->csPlacares);
-    CloseHandle(hPipe);
-    ctx->placares[idx].ativo = FALSE;
-    ctx->placares[idx].hPipe = NULL;
-    ctx->placares[idx].identificador = 0;
-    ctx->placares[idx].temAlerta = FALSE;
-    ctx->placares[idx].msgAlerta[0] = _T('\0');
-    LeaveCriticalSection(&ctx->csPlacares);
-
-    return 0;
-}
-
-static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
-    CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
-    TCHAR nomePipeCompleto[TAM_NOME_PIPE + 10];
-    HANDLE hPipe;
-    BOOL ligado;
-    int slot;
-    ARGS_THREAD_PLACAR* args;
-    HANDLE hThread;
-
-    _sntprintf(nomePipeCompleto, _countof(nomePipeCompleto), _T("\\\\.\\pipe\\%s"), ctx->nomePipe);
-
-    while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
-        hPipe = CreateNamedPipe(
-            nomePipeCompleto,
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            MAX_PLACAR,
-            4096, 4096,
-            0, NULL
-        );
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
-            Sleep(500);
-            continue;
-        }
-
-        PrintConsola(ctx, _T("[DEBUG] Criar uma copia do pipe '%s'...\n"), nomePipeCompleto);
-
-        ligado = ConnectNamedPipe(hPipe, NULL);
-        if (!ligado && GetLastError() != ERROR_PIPE_CONNECTED) {
-            CloseHandle(hPipe);
-            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
-            continue;
-        }
-
-        if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) {
-            CloseHandle(hPipe);
-            break;
-        }
-
-        PrintConsola(ctx, _T("[DEBUG] Ligou-se um placar...\n"));
-
-        EnterCriticalSection(&ctx->csPlacares);
-        slot = EncontrarSlotLivre(ctx);
-        if (slot < 0) {
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
-        ctx->placares[slot].ativo = TRUE;
-        ctx->placares[slot].hPipe = hPipe;
-        ctx->placares[slot].identificador = 0;
-        ctx->placares[slot].temAlerta = FALSE;
-        ctx->placares[slot].msgAlerta[0] = _T('\0');
-        ResetEvent(ctx->placares[slot].eventoConfirmacao);
-        LeaveCriticalSection(&ctx->csPlacares);
-
-        args = (ARGS_THREAD_PLACAR*)malloc(sizeof(ARGS_THREAD_PLACAR));
-        if (args == NULL) {
-            EnterCriticalSection(&ctx->csPlacares);
-            ctx->placares[slot].ativo = FALSE;
-            ctx->placares[slot].hPipe = NULL;
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
-        args->ctx = ctx;
-        args->idx = slot;
-
-        hThread = CreateThread(NULL, 0, ThreadPlacar, args, 0, NULL);
-        if (hThread == NULL) {
-            free(args);
-            EnterCriticalSection(&ctx->csPlacares);
-            ctx->placares[slot].ativo = FALSE;
-            ctx->placares[slot].hPipe = NULL;
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
-        CloseHandle(hThread);
-    }
-    return 0;
-}
-
-static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
-    TCHAR copia[TAM_MAX_COMANDO];
-    TCHAR* tokens[512];
-    TCHAR* ctx_tok;
-    TCHAR* t;
-    int n, i;
-    DWORD duracao, idPlacar;
-    TCHAR msg[TAM_MSG];
-    MSG_ALERTA alerta;
-    int destinos[MAX_PLACAR];
-    HANDLE eventos[MAX_PLACAR];
-    int nDestinos = 0;
-
-    if (args == NULL || args[0] == _T('\0')) return;
-
-    _tcsncpy_s(copia, _countof(copia), args, _TRUNCATE);
-    ctx_tok = NULL;
-    n = 0;
-    t = _tcstok_s(copia, _T(" \t"), &ctx_tok);
-    while (t && n < 512) { tokens[n++] = t; t = _tcstok_s(NULL, _T(" \t"), &ctx_tok); }
-
-    if (n < 3) return;
-
-    if (!ParseDWORDStrict(tokens[n - 2], &duracao) || !ParseDWORDStrict(tokens[n - 1], &idPlacar)) return;
-
-    msg[0] = _T('\0');
-    for (i = 0; i < n - 2; i++) {
-        if (i > 0) _tcsncat_s(msg, _countof(msg), _T(" "), _TRUNCATE);
-        _tcsncat_s(msg, _countof(msg), tokens[i], _TRUNCATE);
-    }
-
-    alerta.tipo = TIPO_NOVO_ALERTA;
-    _tcsncpy_s(alerta.msg, _countof(alerta.msg), msg, _TRUNCATE);
-    alerta.duracao = duracao;
-
-    EnterCriticalSection(&ctx->csPlacares);
-
-    if (idPlacar == 0) {
-        for (i = 0; i < MAX_PLACAR; i++) {
-            if (!ctx->placares[i].ativo) continue;
-            if (EscreverPipePlacar(ctx, i, &alerta, sizeof(MSG_ALERTA))) {
-                PrintConsola(ctx, _T("[DEBUG] Enviei %lu bytes ao placar %lu... %s (tipo = %u)\n"),
-                    (unsigned long)sizeof(MSG_ALERTA),
-                    (unsigned long)ctx->placares[i].identificador,
-                    NomeTipoEnviado(TIPO_NOVO_ALERTA),
-                    (unsigned)TIPO_NOVO_ALERTA);
-                destinos[nDestinos] = i;
-                eventos[nDestinos] = ctx->placares[i].eventoConfirmacao;
-                nDestinos++;
-            }
-        }
-        LeaveCriticalSection(&ctx->csPlacares);
-
-        for (i = 0; i < nDestinos; i++) {
-            WaitForSingleObject(eventos[i], 5000);
-            EnterCriticalSection(&ctx->csPlacares);
-            if (ctx->placares[destinos[i]].ativo) {
-                ctx->placares[destinos[i]].temAlerta = TRUE;
-                _tcsncpy_s(ctx->placares[destinos[i]].msgAlerta, TAM_MSG, msg, _TRUNCATE);
-                PrintConsola(ctx, _T("[DEBUG] Placar %lu com alerta ativo...\n"),
-                    ctx->placares[destinos[i]].identificador);
-            }
-            LeaveCriticalSection(&ctx->csPlacares);
-        }
-    }
-    else {
-        int idx = EncontrarPlacarPorId(ctx, idPlacar);
-        if (idx < 0) {
-            LeaveCriticalSection(&ctx->csPlacares);
-            return;
-        }
-        HANDLE evConf = ctx->placares[idx].eventoConfirmacao;
-        if (EscreverPipePlacar(ctx, idx, &alerta, sizeof(MSG_ALERTA))) {
-            PrintConsola(ctx, _T("[DEBUG] Enviei %lu bytes ao placar %lu... %s (tipo = %u)\n"),
-                (unsigned long)sizeof(MSG_ALERTA),
-                (unsigned long)ctx->placares[idx].identificador,
-                NomeTipoEnviado(TIPO_NOVO_ALERTA),
-                (unsigned)TIPO_NOVO_ALERTA);
-            LeaveCriticalSection(&ctx->csPlacares);
-            WaitForSingleObject(evConf, 5000);
-            EnterCriticalSection(&ctx->csPlacares);
-            if (ctx->placares[idx].ativo) {
-                ctx->placares[idx].temAlerta = TRUE;
-                _tcsncpy_s(ctx->placares[idx].msgAlerta, TAM_MSG, msg, _TRUNCATE);
-                PrintConsola(ctx, _T("[DEBUG] Placar %lu com alerta ativo...\n"), ctx->placares[idx].identificador);
-            }
-            LeaveCriticalSection(&ctx->csPlacares);
-        }
-        else {
-            LeaveCriticalSection(&ctx->csPlacares);
-        }
-    }
-}
-
-static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
-    DWORD idPlacar;
-    int idx;
-    HANDLE evConf;
-    MSG_CMD cmd;
-
-    if (args == NULL || args[0] == _T('\0')) return;
-    if (!ParseDWORDStrict(args, &idPlacar)) return;
-
-    EnterCriticalSection(&ctx->csPlacares);
-    idx = EncontrarPlacarPorId(ctx, idPlacar);
-    if (idx < 0 || !ctx->placares[idx].temAlerta) {
-        LeaveCriticalSection(&ctx->csPlacares);
-        return;
-    }
-
-    evConf = ctx->placares[idx].eventoConfirmacao;
-    cmd.tipo = TIPO_CANCELAR;
-    if (EscreverPipePlacar(ctx, idx, &cmd, sizeof(MSG_CMD))) {
-        PrintConsola(ctx, _T("[DEBUG] Enviei %lu %s ao placar %lu... %s (tipo = %u)\n"),
-            (unsigned long)sizeof(MSG_CMD),
-            sizeof(MSG_CMD) == 1 ? _T("byte") : _T("bytes"),
-            idPlacar,
-            NomeTipoEnviado(TIPO_CANCELAR),
-            (unsigned)TIPO_CANCELAR);
-        LeaveCriticalSection(&ctx->csPlacares);
-        WaitForSingleObject(evConf, 5000);
-        EnterCriticalSection(&ctx->csPlacares);
-        if (ctx->placares[idx].ativo) {
-            ctx->placares[idx].temAlerta = FALSE;
-            ctx->placares[idx].msgAlerta[0] = _T('\0');
-            PrintConsola(ctx, _T("[DEBUG] Cancelado alerta do placar %lu...\n"), idPlacar);
-        }
-        LeaveCriticalSection(&ctx->csPlacares);
-    }
-    else {
-        LeaveCriticalSection(&ctx->csPlacares);
-    }
-}
-
-static void CmdListar(CONTEXTO_APP* ctx) {
-    int i, encontrou;
-    EnterCriticalSection(&ctx->csPlacares);
-    PrintConsola(ctx, _T("--- Lista de placares ---\n"));
-    encontrou = 0;
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (!ctx->placares[i].ativo) continue;
-        encontrou = 1;
-        if (ctx->placares[i].temAlerta) {
-            PrintConsola(ctx, _T("  Placar %lu: alerta ativo = '%s'\n"), ctx->placares[i].identificador, ctx->placares[i].msgAlerta);
-        }
-        else {
-            PrintConsola(ctx, _T("  Placar %lu: sem alerta ativo\n"), ctx->placares[i].identificador);
-        }
-    }
-    if (!encontrou) PrintConsola(ctx, _T("  (nenhum placar ligado)\n"));
-    PrintConsola(ctx, _T("-------------------------\n"));
-    LeaveCriticalSection(&ctx->csPlacares);
-}
-
-static void CmdEncerrar(CONTEXTO_APP* ctx) {
-    int i;
-    MSG_CMD cmd;
-    cmd.tipo = TIPO_ENCERRAR;
-
-    InterlockedExchange(&ctx->deveSair, 1);
-
-    EnterCriticalSection(&ctx->csPlacares);
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (!ctx->placares[i].ativo) continue;
-        EscreverPipePlacar(ctx, i, &cmd, sizeof(MSG_CMD));
-        PrintConsola(ctx, _T("[DEBUG] Enviei %lu %s ao placar %lu... %s (tipo = %u)\n"),
-            (unsigned long)sizeof(MSG_CMD),
-            sizeof(MSG_CMD) == 1 ? _T("byte") : _T("bytes"),
-            (unsigned long)ctx->placares[i].identificador,
-            NomeTipoEnviado(TIPO_ENCERRAR),
-            (unsigned)TIPO_ENCERRAR);
-    }
-    LeaveCriticalSection(&ctx->csPlacares);
-
-    PrintConsola(ctx, _T("[DEBUG] A encerrar plataforma...\n"));
-
-    SetEvent(ctx->eventoParar);
-}
-
-static DWORD WINAPI ThreadComandos(LPVOID param) {
-    CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
-    TCHAR linha[TAM_MAX_COMANDO];
-    size_t len;
-    TCHAR* ctx_tok;
-    TCHAR* cmd;
-    TCHAR* restArgs;
-
-    while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
-        EnterCriticalSection(&ctx->csConsola);
-        _tprintf(_T("CMD> "));
-        LeaveCriticalSection(&ctx->csConsola);
-
-        if (_fgetts(linha, _countof(linha), stdin) == NULL) {
-            InterlockedExchange(&ctx->deveSair, 1);
-            SetEvent(ctx->eventoParar);
-            break;
-        }
-
-        len = _tcslen(linha);
-        while (len > 0 && (linha[len - 1] == _T('\n') || linha[len - 1] == _T('\r')))
-            linha[--len] = _T('\0');
-
-        if (len == 0) continue;
-
-        ctx_tok = NULL;
-        cmd = _tcstok_s(linha, _T(" \t"), &ctx_tok);
-        if (cmd == NULL) continue;
-        restArgs = ctx_tok;
-
-        if (_tcsicmp(cmd, _T("alerta")) == 0) {
-            CmdAlerta(ctx, restArgs);
-        }
-        else if (_tcsicmp(cmd, _T("cancelar")) == 0) {
-            CmdCancelar(ctx, restArgs);
-        }
-        else if (_tcsicmp(cmd, _T("listar")) == 0) {
-            CmdListar(ctx);
-        }
-        else if (_tcsicmp(cmd, _T("encerrar")) == 0) {
-            CmdEncerrar(ctx);
-            break;
-        }
-    }
-    return 0;
-}
-
-int _tmain(int argc, TCHAR* argv[]) {
-    CONTEXTO_APP ctx;
-    HANDLE hThreadLigacoes, hThreadCmds;
-    int i;
-
-    if (argc < 2 || argv[1] == NULL || argv[1][0] == _T('\0')) return 1;
-
-    ZeroMemory(&ctx, sizeof(ctx));
-    _tcsncpy_s(ctx.nomePipe, _countof(ctx.nomePipe), argv[1], _TRUNCATE);
-    ctx.proximoId = 1;
-
-    InitializeCriticalSection(&ctx.csPlacares);
-    InitializeCriticalSection(&ctx.csConsola);
-
-    PrintConsola(&ctx, _T("Named Pipe = '%s'\n"), ctx.nomePipe);
-
-    for (i = 0; i < MAX_PLACAR; i++) {
-        InitializeCriticalSection(&ctx.placares[i].csPipe);
-        ctx.placares[i].eventoConfirmacao = CreateEvent(NULL, FALSE, FALSE, NULL);
-        if (ctx.placares[i].eventoConfirmacao == NULL) {
-            while (--i >= 0) {
-                CloseHandle(ctx.placares[i].eventoConfirmacao);
-                DeleteCriticalSection(&ctx.placares[i].csPipe);
-            }
-            DeleteCriticalSection(&ctx.csPlacares);
-            DeleteCriticalSection(&ctx.csConsola);
-            return 1;
-        }
-    }
-
-    ctx.eventoParar = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (ctx.eventoParar == NULL) return 1;
-
-    hThreadLigacoes = CreateThread(NULL, 0, ThreadAceitarLigacoes, &ctx, 0, NULL);
-    if (hThreadLigacoes == NULL) return 1;
-
-    hThreadCmds = CreateThread(NULL, 0, ThreadComandos, &ctx, 0, NULL);
-    if (hThreadCmds == NULL) {
-        InterlockedExchange(&ctx.deveSair, 1);
-        SetEvent(ctx.eventoParar);
-        WaitForSingleObject(hThreadLigacoes, 3000);
-        return 1;
-    }
-
-    WaitForSingleObject(hThreadCmds, INFINITE);
-
-    InterlockedExchange(&ctx.deveSair, 1);
-    SetEvent(ctx.eventoParar);
-    WaitForSingleObject(hThreadLigacoes, 3000);
-
-    CloseHandle(hThreadCmds);
-    CloseHandle(hThreadLigacoes);
-    CloseHandle(ctx.eventoParar);
-
-    EnterCriticalSection(&ctx.csPlacares);
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (ctx.placares[i].ativo && ctx.placares[i].hPipe != NULL) {
-            CloseHandle(ctx.placares[i].hPipe);
-            ctx.placares[i].hPipe = NULL;
-        }
-        if (ctx.placares[i].eventoConfirmacao)
-            CloseHandle(ctx.placares[i].eventoConfirmacao);
-        DeleteCriticalSection(&ctx.placares[i].csPipe);
-    }
-    LeaveCriticalSection(&ctx.csPlacares);
-
-    DeleteCriticalSection(&ctx.csPlacares);
-    DeleteCriticalSection(&ctx.csConsola);
-    return 0;
-}
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>central</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <CompileAs>CompileAsC</CompileAs>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <CompileAs>CompileAsC</CompileAs>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="central\central.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="protocolo.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

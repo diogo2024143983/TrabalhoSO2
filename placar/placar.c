@@ -267,7 +267,7 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 
         if (tam == 0) continue;
 
-        if (_tcsicmp(comando, _T("liga")) == 0) {
+        if (_tcsicmp(comando, _T("ligar")) == 0) {
             if (InterlockedCompareExchange(&ctx->ligado, 0, 0) != 0) continue;
 
             cmd.tipo = TIPO_LIGAR;
@@ -285,7 +285,7 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
             PrintConsola(ctx, _T("Identificador = %lu\n"), ctx->identificador);
 
         }
-        else if (_tcsicmp(comando, _T("desliga")) == 0) {
+        else if (_tcsicmp(comando, _T("desligar")) == 0) {
             if (InterlockedCompareExchange(&ctx->ligado, 0, 0) == 0) {
                 InterlockedExchange(&ctx->deveSair, 1);
                 SetEvent(ctx->eventoParar);
