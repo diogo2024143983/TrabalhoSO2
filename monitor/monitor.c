@@ -17,12 +17,21 @@
 // Control IDs
 #define ID_LISTVIEW     101
 #define ID_MAX_ALERTAS  102
+#define ID_STATUSBAR    103
+#define ID_BTN_PREV     104
+#define ID_BTN_NEXT     105
+#define ID_LBL_PAGE     106
+
+// Cores para UI
+#define COLOR_URGENT    RGB(255, 0, 0)
+#define COLOR_WARNING   RGB(255, 165, 0)
+#define COLOR_NORMAL    RGB(0, 100, 200)
 
 // Dados do grupo (autores)
-#define AUTOR1_NOME     _T("Diogo Filipe")
-#define AUTOR1_NUMERO   _T("2024143983")
-#define AUTOR2_NOME     _T("Segundo Aluno")
-#define AUTOR2_NUMERO   _T("2024000000")
+#define AUTOR1_NOME     _T("Rodrigo Cravo Pereira")
+#define AUTOR1_NUMERO   _T("2024117439")
+#define AUTOR2_NOME     _T("Diogo Ribeiro Costa")
+#define AUTOR2_NUMERO   _T("2024143983")
 
 typedef struct {
     // Memoria partilhada
@@ -34,10 +43,15 @@ typedef struct {
 
     // UI
     HWND hWndListView;
+    HWND hStatusBar;
+    HWND hBtnPrev;
+    HWND hBtnNext;
+    HWND hLblPage;
     HWND hDlgConfig;
     int maxAlertas;
     int paginaAtual;
     BOOL deveSair;
+    HBRUSH hBrushBg;
 
     // Nomes configuráveis (para DialogBox)
     TCHAR shmName[256];
@@ -65,22 +79,26 @@ static int ContarAlertasAtivos(void) {
 
 // Atualiza a ListView com os dados da SHM
 static void AtualizarListView(HWND hWndLV) {
-    int i, count;
+    int i, count, totalAlertas;
     int inicio, fim;
     LVITEM lvi;
-    TCHAR buf[64];
+    TCHAR buf[128];
 
     if (hWndLV == NULL) return;
 
     ListView_DeleteAllItems(hWndLV);
 
-    if (g_ctx.shm == NULL) return;
+    if (g_ctx.shm == NULL) {
+        SetDlgItemText(g_ctx.hStatusBar, 0, _T("Estado: Desconectado do servidor"));
+        return;
+    }
 
     WaitForSingleObject(g_ctx.hMutexShm, INFINITE);
 
     // Verificar se a plataforma foi encerrada
     if (g_ctx.shm->desligar) {
         ReleaseMutex(g_ctx.hMutexShm);
+        SetDlgItemText(g_ctx.hStatusBar, 0, _T("Estado: Plataforma encerrada"));
         return;
     }
 
@@ -92,12 +110,24 @@ static void AtualizarListView(HWND hWndLV) {
             count++;
         }
     }
+    totalAlertas = count;
 
     // Calcular paginacao
     if (g_ctx.maxAlertas <= 0) g_ctx.maxAlertas = 10;
     inicio = g_ctx.paginaAtual * g_ctx.maxAlertas;
     fim = inicio + g_ctx.maxAlertas;
     if (fim > count) fim = count;
+
+    // Atualizar status bar
+    int totalPaginas = (totalAlertas + g_ctx.maxAlertas - 1) / g_ctx.maxAlertas;
+    if (totalPaginas == 0) totalPaginas = 1;
+    _stprintf_s(buf, _countof(buf), _T("Alertas: %d  |  Página: %d/%d"), 
+                totalAlertas, g_ctx.paginaAtual + 1, totalPaginas);
+    SetDlgItemText(g_ctx.hStatusBar, 0, buf);
+
+    // Habilitar/desabilitar botões de navegação
+    EnableWindow(g_ctx.hBtnPrev, g_ctx.paginaAtual > 0);
+    EnableWindow(g_ctx.hBtnNext, g_ctx.paginaAtual < totalPaginas - 1);
 
     // Preencher ListView apenas com os itens da pagina atual
     count = 0;
@@ -111,7 +141,7 @@ static void AtualizarListView(HWND hWndLV) {
                 lvi.iItem = count - inicio;
 
                 // Coluna 0: Identificador
-                _stprintf_s(buf, _countof(buf), _T("%lu"), g_ctx.shm->placar[i].identificador);
+                _stprintf_s(buf, _countof(buf), _T("Placar #%lu"), g_ctx.shm->placar[i].identificador);
                 lvi.iSubItem = 0;
                 lvi.pszText = buf;
                 ListView_InsertItem(hWndLV, &lvi);
@@ -218,41 +248,76 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
         INITCOMMONCONTROLSEX icex;
         icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-        icex.dwICC = ICC_LISTVIEW_CLASSES;
+        icex.dwICC = ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS | ICC_BAR_CLASSES;
         InitCommonControlsEx(&icex);
 
+        // Criar status bar
+        g_ctx.hStatusBar = CreateWindowEx(0, STATUSCLASSNAME, NULL,
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            0, 0, 0, 0, hWnd, (HMENU)ID_STATUSBAR, hInst, NULL);
+        
+        SendMessage(g_ctx.hStatusBar, SB_SETTEXT, 0, (LPARAM)_T("Conectando..."));
+
+        // Criar ListView com melhor visual
         g_ctx.hWndListView = CreateWindow(WC_LISTVIEW, _T(""),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
-            LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
-            10, 10, 600, 400,
+            LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER | LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT,
+            10, 45, 600, 350,
             hWnd, (HMENU)ID_LISTVIEW, hInst, NULL);
 
         if (g_ctx.hWndListView == NULL) return -1;
 
-        // Configurar colunas
+        // Aplicar estilos extendidos
+        DWORD dwExStyle = LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP;
+        ListView_SetExtendedListViewStyle(g_ctx.hWndListView, dwExStyle);
+
+        // Configurar colunas com melhor espaçamento
         LVCOLUMN lvc;
         TCHAR headers[][32] = {
-            _T("Identificador"),
-            _T("Mensagem"),
-            _T("Duracao")
+            _T("📍 Placar"),
+            _T("⚠️ Mensagem"),
+            _T("⏱️ Duração")
         };
         int i;
         for (i = 0; i < 3; i++) {
             ZeroMemory(&lvc, sizeof(lvc));
             lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
             lvc.pszText = headers[i];
-            lvc.cx = (i == 0) ? 120 : (i == 1) ? 350 : 100;
+            lvc.cx = (i == 0) ? 100 : (i == 1) ? 400 : 80;
             ListView_InsertColumn(g_ctx.hWndListView, i, &lvc);
         }
 
-        // Criar menu
+        // Botões de navegação
+        g_ctx.hBtnPrev = CreateWindow(_T("BUTTON"), _T("◄ Anterior (PgUp)"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            10, 410, 140, 28, hWnd, (HMENU)ID_BTN_PREV, hInst, NULL);
+
+        g_ctx.hBtnNext = CreateWindow(_T("BUTTON"), _T("Próximo (PgDn) ►"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            160, 410, 140, 28, hWnd, (HMENU)ID_BTN_NEXT, hInst, NULL);
+
+        // Label de página
+        g_ctx.hLblPage = CreateWindow(_T("STATIC"), _T("Página 1/1"),
+            WS_CHILD | WS_VISIBLE | SS_CENTER,
+            310, 410, 300, 28, hWnd, (HMENU)ID_LBL_PAGE, hInst, NULL);
+
+        // Criar menu melhorado
         HMENU hMenu = CreateMenu();
         HMENU hFileMenu = CreatePopupMenu();
-        AppendMenu(hFileMenu, MF_STRING, 1001, _T("Configuracao"));
-        AppendMenu(hFileMenu, MF_STRING, 1002, _T("Acerca"));
+        HMENU hViewMenu = CreatePopupMenu();
+        
+        AppendMenu(hFileMenu, MF_STRING, 1001, _T("⚙️ Configuração"));
+        AppendMenu(hFileMenu, MF_STRING, 1002, _T("ℹ️ Acerca"));
         AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
-        AppendMenu(hFileMenu, MF_STRING, 1003, _T("Sair"));
+        AppendMenu(hFileMenu, MF_STRING, 1003, _T("❌ Sair"));
+        
+        AppendMenu(hViewMenu, MF_STRING, 2001, _T("🔄 Atualizar Agora (F5)"));
+        AppendMenu(hViewMenu, MF_STRING, 2002, _T("🏠 Primeira Página (Home)"));
+        AppendMenu(hViewMenu, MF_STRING, 2003, _T("📍 Última Página (End)"));
+        
         AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, _T("Ficheiro"));
+        AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, _T("Ver"));
+        
         SetMenu(hWnd, hMenu);
 
         // Iniciar thread de monitorizacao
@@ -263,15 +328,38 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     }
 
-    case WM_SIZE:
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        
+        // Redimensionar ListView
         if (g_ctx.hWndListView) {
-            RECT rc;
-            GetClientRect(hWnd, &rc);
             SetWindowPos(g_ctx.hWndListView, NULL,
-                10, 10, rc.right - 20, rc.bottom - 50,
+                10, 45, rc.right - 20, rc.bottom - 130,
                 SWP_NOZORDER);
         }
+        
+        // Redimensionar botões
+        if (g_ctx.hBtnPrev) {
+            SetWindowPos(g_ctx.hBtnPrev, NULL,
+                10, rc.bottom - 75, 140, 28,
+                SWP_NOZORDER);
+        }
+        if (g_ctx.hBtnNext) {
+            SetWindowPos(g_ctx.hBtnNext, NULL,
+                160, rc.bottom - 75, 140, 28,
+                SWP_NOZORDER);
+        }
+        if (g_ctx.hLblPage) {
+            SetWindowPos(g_ctx.hLblPage, NULL,
+                310, rc.bottom - 75, rc.right - 320, 28,
+                SWP_NOZORDER);
+        }
+        
+        // Redimensionar status bar (automático)
+        SendMessage(g_ctx.hStatusBar, WM_SIZE, 0, 0);
         break;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -284,20 +372,64 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case 1002: { // Acerca
             TCHAR msg[512];
             _stprintf_s(msg, _countof(msg),
-                _T("Trabalho SO2 - Placar Informativo\n\n")
+                _T("Trabalho SO2 - Monitor de Alertas\n\n")
+                _T("Plataforma de Informação com Placares\n")
+                _T("Módulo 3 - Memória Partilhada e Eventos\n\n")
                 _T("Autores:\n")
                 _T("  %s - %s\n")
                 _T("  %s - %s\n\n")
-                _T("M3 - Programa Monitor"),
+                _T("© 2026 Universidade"),
                 AUTOR1_NOME, AUTOR1_NUMERO,
                 AUTOR2_NOME, AUTOR2_NUMERO);
-            MessageBox(hWnd, msg, _T("Acerca"), MB_OK | MB_ICONINFORMATION);
+            MessageBox(hWnd, msg, _T("📋 Acerca do Monitor"), MB_OK | MB_ICONINFORMATION);
             break;
         }
 
         case 1003: // Sair
             DestroyWindow(hWnd);
             break;
+
+        case 2001: // Atualizar agora
+            if (g_ctx.hWndListView) {
+                AtualizarListView(g_ctx.hWndListView);
+            }
+            break;
+
+        case 2002: // Primeira página
+            g_ctx.paginaAtual = 0;
+            if (g_ctx.hWndListView) {
+                AtualizarListView(g_ctx.hWndListView);
+            }
+            break;
+
+        case 2003: { // Última página
+            totalAlertas = ContarAlertasAtivos();
+            totalPaginas = (totalAlertas + g_ctx.maxAlertas - 1) / g_ctx.maxAlertas;
+            if (totalPaginas == 0) totalPaginas = 1;
+            g_ctx.paginaAtual = totalPaginas - 1;
+            if (g_ctx.hWndListView) {
+                AtualizarListView(g_ctx.hWndListView);
+            }
+            break;
+        }
+
+        case ID_BTN_PREV: // Botão Anterior
+            if (g_ctx.paginaAtual > 0) {
+                g_ctx.paginaAtual--;
+                AtualizarListView(g_ctx.hWndListView);
+            }
+            break;
+
+        case ID_BTN_NEXT: { // Botão Próximo
+            totalAlertas = ContarAlertasAtivos();
+            totalPaginas = (totalAlertas + g_ctx.maxAlertas - 1) / g_ctx.maxAlertas;
+            if (totalPaginas == 0) totalPaginas = 1;
+            if (g_ctx.paginaAtual < totalPaginas - 1) {
+                g_ctx.paginaAtual++;
+                AtualizarListView(g_ctx.hWndListView);
+            }
+            break;
+        }
         }
         break;
 
@@ -317,6 +449,20 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 AtualizarListView(g_ctx.hWndListView);
             }
         }
+        else if (wParam == VK_HOME) { // Home
+            g_ctx.paginaAtual = 0;
+            AtualizarListView(g_ctx.hWndListView);
+        }
+        else if (wParam == VK_END) { // End
+            totalAlertas = ContarAlertasAtivos();
+            totalPaginas = (totalAlertas + g_ctx.maxAlertas - 1) / g_ctx.maxAlertas;
+            if (totalPaginas == 0) totalPaginas = 1;
+            g_ctx.paginaAtual = totalPaginas - 1;
+            AtualizarListView(g_ctx.hWndListView);
+        }
+        else if (wParam == VK_F5) { // F5
+            AtualizarListView(g_ctx.hWndListView);
+        }
         break;
 
     case WM_DESTROY:
@@ -325,6 +471,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WaitForSingleObject(g_ctx.hThreadMonitor, 1000);
             CloseHandle(g_ctx.hThreadMonitor);
         }
+        if (g_ctx.hBrushBg) DeleteObject(g_ctx.hBrushBg);
         PostQuitMessage(0);
         break;
     }

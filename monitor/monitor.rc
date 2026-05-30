@@ -10,19 +10,27 @@
 LANGUAGE 0x16, 0x01
 #pragma code_page(1252)
 
-IDD_DIALOG1 DIALOGEX 0, 0, 280, 180
+IDD_DIALOG1 DIALOGEX 0, 0, 320, 220
 STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Configuracao"
-FONT 8, "MS Shell Dlg", 0, 0, 0x0
+CAPTION "⚙️ Configuração do Monitor"
+FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Numero maximo de alertas:", -1, 10, 10, 120, 10
-    EDITTEXT        IDC_EDIT1, 140, 8, 50, 14, ES_NUMBER
-    LTEXT           "Nome SHM:", -1, 10, 35, 120, 10
-    EDITTEXT        IDC_EDIT2, 140, 33, 130, 14
-    LTEXT           "Nome Evento:", -1, 10, 60, 120, 10
-    EDITTEXT        IDC_EDIT3, 140, 58, 130, 14
-    LTEXT           "Nome Mutex:", -1, 10, 85, 120, 10
-    EDITTEXT        IDC_EDIT4, 140, 83, 130, 14
-    DEFPUSHBUTTON   "OK", IDOK, 60, 120, 60, 15
-    PUSHBUTTON      "Cancelar", IDCANCEL, 140, 120, 60, 15
+    GROUPBOX        "Visualização", -1, 10, 5, 300, 45
+    LTEXT           "Máximo de alertas por página:", -1, 20, 18, 150, 10
+    EDITTEXT        IDC_EDIT1, 200, 16, 50, 14, ES_NUMBER
+
+    GROUPBOX        "Nomes de Recursos (Avançado)", -1, 10, 55, 300, 125
+    LTEXT           "Nome do SHM:", -1, 20, 70, 150, 10
+    EDITTEXT        IDC_EDIT2, 20, 82, 280, 14
+    
+    LTEXT           "Nome do Evento:", -1, 20, 100, 150, 10
+    EDITTEXT        IDC_EDIT3, 20, 112, 280, 14
+    
+    LTEXT           "Nome do Mutex:", -1, 20, 130, 150, 10
+    EDITTEXT        IDC_EDIT4, 20, 142, 280, 14
+
+    LTEXT           "💡 Deixar em branco para usar valores predefinidos", -1, 20, 160, 280, 10, WS_DISABLED
+
+    DEFPUSHBUTTON   "✓ OK", IDOK, 80, 190, 70, 18
+    PUSHBUTTON      "✕ Cancelar", IDCANCEL, 170, 190, 70, 18
 END
