@@ -274,9 +274,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         // Configurar colunas com melhor espaçamento
         LVCOLUMN lvc;
         TCHAR headers[][32] = {
-            _T("📍 Placar"),
-            _T("⚠️ Mensagem"),
-            _T("⏱️ Duração")
+            _T("Placar"),
+            _T("Mensagem"),
+            _T("Duracao")
         };
         int i;
         for (i = 0; i < 3; i++) {
@@ -288,11 +288,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         // Botões de navegação
-        g_ctx.hBtnPrev = CreateWindow(_T("BUTTON"), _T("◄ Anterior (PgUp)"),
+        g_ctx.hBtnPrev = CreateWindow(_T("BUTTON"), _T("< Anterior"),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             10, 410, 140, 28, hWnd, (HMENU)ID_BTN_PREV, hInst, NULL);
 
-        g_ctx.hBtnNext = CreateWindow(_T("BUTTON"), _T("Próximo (PgDn) ►"),
+        g_ctx.hBtnNext = CreateWindow(_T("BUTTON"), _T("Proximo >"),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             160, 410, 140, 28, hWnd, (HMENU)ID_BTN_NEXT, hInst, NULL);
 
@@ -306,14 +306,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         HMENU hFileMenu = CreatePopupMenu();
         HMENU hViewMenu = CreatePopupMenu();
         
-        AppendMenu(hFileMenu, MF_STRING, 1001, _T("⚙️ Configuração"));
-        AppendMenu(hFileMenu, MF_STRING, 1002, _T("ℹ️ Acerca"));
+        AppendMenu(hFileMenu, MF_STRING, 1001, _T("Configuracao"));
+        AppendMenu(hFileMenu, MF_STRING, 1002, _T("Acerca"));
         AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
-        AppendMenu(hFileMenu, MF_STRING, 1003, _T("❌ Sair"));
+        AppendMenu(hFileMenu, MF_STRING, 1003, _T("Sair"));
         
-        AppendMenu(hViewMenu, MF_STRING, 2001, _T("🔄 Atualizar Agora (F5)"));
-        AppendMenu(hViewMenu, MF_STRING, 2002, _T("🏠 Primeira Página (Home)"));
-        AppendMenu(hViewMenu, MF_STRING, 2003, _T("📍 Última Página (End)"));
+        AppendMenu(hViewMenu, MF_STRING, 2001, _T("Atualizar Agora (F5)"));
+        AppendMenu(hViewMenu, MF_STRING, 2002, _T("Primeira Pagina (Home)"));
+        AppendMenu(hViewMenu, MF_STRING, 2003, _T("Ultima Pagina (End)"));
         
         AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, _T("Ficheiro"));
         AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, _T("Ver"));
@@ -381,7 +381,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 _T("© 2026 Universidade"),
                 AUTOR1_NOME, AUTOR1_NUMERO,
                 AUTOR2_NOME, AUTOR2_NUMERO);
-            MessageBox(hWnd, msg, _T("📋 Acerca do Monitor"), MB_OK | MB_ICONINFORMATION);
+            MessageBox(hWnd, msg, _T("Acerca do Monitor"), MB_OK | MB_ICONINFORMATION);
             break;
         }
 
