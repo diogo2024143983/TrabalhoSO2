@@ -1,294 +1,300 @@
-#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
-#include <winsock2.h>
 #include <tchar.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include "../protocolo.h"
 
-#pragma comment(lib, "ws2_32.lib")
+#define ID_CONFIGURACAO 1001
+#define ID_ACERCA 1002
+#define ID_SAIR 1003
+#define IDC_MAX_ALERTAS 2001
+#define IDC_SHM_NAME 2002
+#define IDC_MUTEX_NAME 2003
+#define IDC_EVENT_NAME 2004
+#define IDC_BTN_OK 2005
 
-#define TAM_SHARED_MEM   65536
-#define PORTA_MONITOR    5555
-#define MAX_CLIENTES     256
+HANDLE hMapFile = NULL;
+SHM_ALERTA* pDados = NULL;
+HANDLE hEvent = NULL;
+HANDLE hMutex = NULL;
+HANDLE hThread = NULL;
 
-typedef struct {
-    BOOL ativo;
-    DWORD identificador;
-    BOOL temAlerta;
-    TCHAR msgAlerta[TAM_MSG];
-} ESTADO_PLACAR_MONITOR;
+int maxAlertas = 5;
+int paginaAtual = 0;
+HWND hMainWindow;
+HWND hConfigWindow = NULL;
 
-typedef struct {
-    ESTADO_PLACAR_MONITOR placares[MAX_PLACAR];
-    DWORD numPlacares;
-    SYSTEMTIME ultimaAtualizacao;
-} DADOS_MONITOR;
+TCHAR nomeSHM[256] = _T("Local\\SO2_SHM");
+TCHAR nomeMutex[256] = _T("Local\\SO2_MUTEX");
+TCHAR nomeEvento[256] = _T("Local\\SO2_EVENT");
 
-typedef struct {
-    HANDLE hMapFile;
-    DADOS_MONITOR* pDados;
-    SOCKET sockUDP;
-    SOCKET sockTCP;
-    HANDLE eventoParar;
-    CRITICAL_SECTION csConsola;
-    volatile LONG deveSair;
-} CONTEXTO_MONITOR;
+HFONT hFontTitulo;
+HFONT hFontNormal;
+HFONT hFontBold;
 
-static void PrintConsola(CONTEXTO_MONITOR* ctx, const TCHAR* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    EnterCriticalSection(&ctx->csConsola);
-    _vtprintf(fmt, args);
-    LeaveCriticalSection(&ctx->csConsola);
-    va_end(args);
+void DesligarRecursos() {
+    if (pDados) { UnmapViewOfFile(pDados); pDados = NULL; }
+    if (hMapFile) { CloseHandle(hMapFile); hMapFile = NULL; }
+    if (hEvent) { CloseHandle(hEvent); hEvent = NULL; }
+    if (hMutex) { CloseHandle(hMutex); hMutex = NULL; }
 }
 
-static BOOL InicializarSharedMemory(CONTEXTO_MONITOR* ctx) {
-    ctx->hMapFile = OpenFileMapping(FILE_MAP_READ, FALSE, _T("TrabSO2_SharedMem"));
-    if (ctx->hMapFile == NULL) {
-        PrintConsola(ctx, _T("[Monitor] Criando shared memory...\n"));
-        ctx->hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, TAM_SHARED_MEM, _T("TrabSO2_SharedMem"));
-        if (ctx->hMapFile == NULL) {
-            PrintConsola(ctx, _T("[Monitor] Erro ao criar shared memory\n"));
-            return FALSE;
-        }
-    }
-
-    ctx->pDados = (DADOS_MONITOR*)MapViewOfFile(ctx->hMapFile, FILE_MAP_READ, 0, 0, TAM_SHARED_MEM);
-    if (ctx->pDados == NULL) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao mapear shared memory\n"));
-        CloseHandle(ctx->hMapFile);
-        return FALSE;
-    }
-
-    PrintConsola(ctx, _T("[Monitor] Shared memory conectada com sucesso\n"));
-    return TRUE;
+BOOL LigarRecursos() {
+    DesligarRecursos();
+    hMapFile = OpenFileMapping(FILE_MAP_READ, FALSE, nomeSHM);
+    if (hMapFile) pDados = (SHM_ALERTA*)MapViewOfFile(hMapFile, FILE_MAP_READ, 0, 0, sizeof(SHM_ALERTA));
+    hEvent = OpenEvent(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, nomeEvento);
+    hMutex = OpenMutex(SYNCHRONIZE, FALSE, nomeMutex);
+    return (pDados && hEvent && hMutex);
 }
 
-static BOOL InicializarSockets(CONTEXTO_MONITOR* ctx) {
-    WSADATA wsaData;
-    struct sockaddr_in addr;
-    int reuso = 1;
-
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao inicializar Winsock\n"));
-        return FALSE;
-    }
-
-    // Socket UDP para broadcast
-    ctx->sockUDP = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ctx->sockUDP == INVALID_SOCKET) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao criar socket UDP\n"));
-        WSACleanup();
-        return FALSE;
-    }
-
-    setsockopt(ctx->sockUDP, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuso, sizeof(reuso));
-    
-    ZeroMemory(&addr, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("255.255.255.255");
-    addr.sin_port = htons(PORTA_MONITOR);
-
-    if (bind(ctx->sockUDP, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao fazer bind UDP\n"));
-        closesocket(ctx->sockUDP);
-        WSACleanup();
-        return FALSE;
-    }
-
-    int broadcast = 1;
-    setsockopt(ctx->sockUDP, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
-
-    // Socket TCP para clientes
-    ctx->sockTCP = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (ctx->sockTCP == INVALID_SOCKET) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao criar socket TCP\n"));
-        closesocket(ctx->sockUDP);
-        WSACleanup();
-        return FALSE;
-    }
-
-    setsockopt(ctx->sockTCP, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuso, sizeof(reuso));
-
-    ZeroMemory(&addr, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(PORTA_MONITOR + 1);
-
-    if (bind(ctx->sockTCP, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao fazer bind TCP\n"));
-        closesocket(ctx->sockUDP);
-        closesocket(ctx->sockTCP);
-        WSACleanup();
-        return FALSE;
-    }
-
-    if (listen(ctx->sockTCP, SOMAXCONN) == SOCKET_ERROR) {
-        PrintConsola(ctx, _T("[Monitor] Erro ao fazer listen TCP\n"));
-        closesocket(ctx->sockUDP);
-        closesocket(ctx->sockTCP);
-        WSACleanup();
-        return FALSE;
-    }
-
-    PrintConsola(ctx, _T("[Monitor] Sockets criados com sucesso (UDP:%d, TCP:%d)\n"), PORTA_MONITOR, PORTA_MONITOR + 1);
-    return TRUE;
-}
-
-static char* Convertir(char* buffer, int buflen, const TCHAR* texto) {
-#ifdef _UNICODE
-    int len = WideCharToMultiByte(CP_ACP, 0, texto, -1, buffer, buflen, NULL, NULL);
-    if (len == 0) buffer[0] = '\0';
-#else
-    strncpy_s(buffer, buflen, texto, _TRUNCATE);
-#endif
-    return buffer;
-}
-
-static void EnviarEstado(CONTEXTO_MONITOR* ctx) {
-    char buffer[2048];
-    int pos = 0;
-    int i;
-    char temp[512];
-    struct sockaddr_in broadcast_addr;
-
-    if (ctx->pDados == NULL) return;
-
-    pos += sprintf_s(buffer + pos, sizeof(buffer) - pos, "=== PLACAR INFORMATIVO ===\n");
-    pos += sprintf_s(buffer + pos, sizeof(buffer) - pos, "Placares ativos: %lu\n", ctx->pDados->numPlacares);
-
-    for (i = 0; i < MAX_PLACAR; i++) {
-        if (!ctx->pDados->placares[i].ativo) continue;
-        
-        Convertir(temp, sizeof(temp), ctx->pDados->placares[i].msgAlerta);
-        if (ctx->pDados->placares[i].temAlerta) {
-            pos += sprintf_s(buffer + pos, sizeof(buffer) - pos, 
-                "  Placar %lu: %s\n", 
-                ctx->pDados->placares[i].identificador,
-                temp);
-        } else {
-            pos += sprintf_s(buffer + pos, sizeof(buffer) - pos, 
-                "  Placar %lu: sem alerta\n", 
-                ctx->pDados->placares[i].identificador);
-        }
-    }
-
-    // Enviar via UDP broadcast
-    ZeroMemory(&broadcast_addr, sizeof(broadcast_addr));
-    broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
-    broadcast_addr.sin_port = htons(PORTA_MONITOR);
-
-    sendto(ctx->sockUDP, buffer, (int)strlen(buffer), 0, (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
-}
-
-static DWORD WINAPI ThreadAtualizacao(LPVOID param) {
-    CONTEXTO_MONITOR* ctx = (CONTEXTO_MONITOR*)param;
-
-    while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
-        EnviarEstado(ctx);
-        Sleep(1000);
-    }
-    return 0;
-}
-
-static DWORD WINAPI ThreadClienteTCP(LPVOID param) {
-    SOCKET clientSocket = (SOCKET)param;
-    char buffer[2048];
-    int recebidos;
-
+DWORD WINAPI ThreadMonitorUpdates(LPVOID lpParam) {
+    HWND hWnd = (HWND)lpParam;
     while (1) {
-        recebidos = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-        if (recebidos <= 0) break;
-        buffer[recebidos] = '\0';
-
-        if (strncmp(buffer, "STATUS", 6) == 0) {
-            // Cliente pediu status - será enviado pela thread de atualização
+        if (hEvent == NULL) {
+            Sleep(1000);
             continue;
         }
-    }
-
-    closesocket(clientSocket);
-    return 0;
-}
-
-static DWORD WINAPI ThreadAceitarClientes(LPVOID param) {
-    CONTEXTO_MONITOR* ctx = (CONTEXTO_MONITOR*)param;
-    SOCKET clientSocket;
-    struct sockaddr_in clientAddr;
-    int addrLen = sizeof(clientAddr);
-    HANDLE hThread;
-
-    while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
-        clientSocket = accept(ctx->sockTCP, (struct sockaddr*)&clientAddr, &addrLen);
-        if (clientSocket == INVALID_SOCKET) {
-            Sleep(100);
-            continue;
-        }
-
-        hThread = CreateThread(NULL, 0, ThreadClienteTCP, (LPVOID)clientSocket, 0, NULL);
-        if (hThread != NULL) {
-            CloseHandle(hThread);
-        } else {
-            closesocket(clientSocket);
+        DWORD res = WaitForSingleObject(hEvent, 1000);
+        if (res == WAIT_OBJECT_0) {
+            if (pDados && pDados->desligar) {
+                PostMessage(hWnd, WM_CLOSE, 0, 0);
+                break;
+            }
+            InvalidateRect(hWnd, NULL, FALSE);
+            ResetEvent(hEvent);
         }
     }
     return 0;
 }
 
-int _tmain(int argc, TCHAR* argv[]) {
-    CONTEXTO_MONITOR ctx;
-    HANDLE hThreadAtualizacao, hThreadClientes;
-
-    ZeroMemory(&ctx, sizeof(ctx));
-    InitializeCriticalSection(&ctx.csConsola);
-    ctx.eventoParar = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    PrintConsola(&ctx, _T("[Monitor] Iniciando Monitor da Plataforma Placar...\n"));
-
-    if (!InicializarSharedMemory(&ctx)) {
-        DeleteCriticalSection(&ctx.csConsola);
-        return 1;
+LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        CreateWindow(_T("STATIC"), _T("Max Alertas/Pagina:"), WS_CHILD | WS_VISIBLE, 10, 10, 150, 20, hWnd, NULL, NULL, NULL);
+        CreateWindow(_T("EDIT"), _T("5"), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 160, 10, 100, 20, hWnd, (HMENU)IDC_MAX_ALERTAS, NULL, NULL);
+        CreateWindow(_T("STATIC"), _T("Nome SHM:"), WS_CHILD | WS_VISIBLE, 10, 40, 150, 20, hWnd, NULL, NULL, NULL);
+        CreateWindow(_T("EDIT"), nomeSHM, WS_CHILD | WS_VISIBLE | WS_BORDER, 160, 40, 100, 20, hWnd, (HMENU)IDC_SHM_NAME, NULL, NULL);
+        CreateWindow(_T("STATIC"), _T("Nome Mutex:"), WS_CHILD | WS_VISIBLE, 10, 70, 150, 20, hWnd, NULL, NULL, NULL);
+        CreateWindow(_T("EDIT"), nomeMutex, WS_CHILD | WS_VISIBLE | WS_BORDER, 160, 70, 100, 20, hWnd, (HMENU)IDC_MUTEX_NAME, NULL, NULL);
+        CreateWindow(_T("STATIC"), _T("Nome Evento:"), WS_CHILD | WS_VISIBLE, 10, 100, 150, 20, hWnd, NULL, NULL, NULL);
+        CreateWindow(_T("EDIT"), nomeEvento, WS_CHILD | WS_VISIBLE | WS_BORDER, 160, 100, 100, 20, hWnd, (HMENU)IDC_EVENT_NAME, NULL, NULL);
+        CreateWindow(_T("BUTTON"), _T("Guardar e Aplicar"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 60, 140, 150, 30, hWnd, (HMENU)IDC_BTN_OK, NULL, NULL);
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_BTN_OK) {
+            BOOL trans;
+            int maxA = GetDlgItemInt(hWnd, IDC_MAX_ALERTAS, &trans, FALSE);
+            if (trans && maxA > 0) maxAlertas = maxA;
+            GetWindowText(GetDlgItem(hWnd, IDC_SHM_NAME), nomeSHM, 256);
+            GetWindowText(GetDlgItem(hWnd, IDC_MUTEX_NAME), nomeMutex, 256);
+            GetWindowText(GetDlgItem(hWnd, IDC_EVENT_NAME), nomeEvento, 256);
+            LigarRecursos();
+            paginaAtual = 0;
+            InvalidateRect(hMainWindow, NULL, FALSE);
+            DestroyWindow(hWnd);
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        break;
+    case WM_DESTROY:
+        hConfigWindow = NULL;
+        break;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
     }
-
-    if (!InicializarSockets(&ctx)) {
-        UnmapViewOfFile(ctx.pDados);
-        CloseHandle(ctx.hMapFile);
-        DeleteCriticalSection(&ctx.csConsola);
-        return 1;
-    }
-
-    hThreadAtualizacao = CreateThread(NULL, 0, ThreadAtualizacao, &ctx, 0, NULL);
-    hThreadClientes = CreateThread(NULL, 0, ThreadAceitarClientes, &ctx, 0, NULL);
-
-    if (!hThreadAtualizacao || !hThreadClientes) {
-        InterlockedExchange(&ctx.deveSair, 1);
-        SetEvent(ctx.eventoParar);
-        return 1;
-    }
-
-    PrintConsola(&ctx, _T("[Monitor] Aguardando pressionar ENTER para sair...\n"));
-    _getts_s(NULL, 0);
-
-    InterlockedExchange(&ctx.deveSair, 1);
-    SetEvent(ctx.eventoParar);
-
-    WaitForSingleObject(hThreadAtualizacao, 3000);
-    WaitForSingleObject(hThreadClientes, 3000);
-
-    closesocket(ctx.sockUDP);
-    closesocket(ctx.sockTCP);
-    WSACleanup();
-
-    UnmapViewOfFile(ctx.pDados);
-    CloseHandle(ctx.hMapFile);
-    CloseHandle(hThreadAtualizacao);
-    CloseHandle(hThreadClientes);
-    CloseHandle(ctx.eventoParar);
-    DeleteCriticalSection(&ctx.csConsola);
-
     return 0;
+}
+
+void AbrirConfiguracao(HINSTANCE hInstance) {
+    if (hConfigWindow != NULL) {
+        BringWindowToTop(hConfigWindow);
+        return;
+    }
+    WNDCLASSEX wcex = { 0 };
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.lpfnWndProc = ConfigWndProc;
+    wcex.hInstance = hInstance;
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszClassName = _T("ConfigClass");
+    RegisterClassEx(&wcex);
+    hConfigWindow = CreateWindow(_T("ConfigClass"), _T("Configuracao do Monitor"), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 230, hMainWindow, NULL, hInstance, NULL);
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    PAINTSTRUCT ps;
+    HDC hdc;
+    TCHAR buffer[512];
+    int y = 80;
+
+    switch (message) {
+    case WM_CREATE:
+    {
+        HMENU hMenu = CreateMenu();
+        HMENU hSubMenu = CreatePopupMenu();
+        AppendMenu(hSubMenu, MF_STRING, ID_CONFIGURACAO, _T("Configuracao"));
+        AppendMenu(hSubMenu, MF_STRING, ID_ACERCA, _T("Acerca"));
+        AppendMenu(hSubMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenu(hSubMenu, MF_STRING, ID_SAIR, _T("Sair"));
+        AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hSubMenu, _T("Ficheiro"));
+        SetMenu(hWnd, hMenu);
+
+        hFontTitulo = CreateFont(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
+        hFontNormal = CreateFont(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
+        hFontBold = CreateFont(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
+    }
+    break;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_SAIR) {
+            PostMessage(hWnd, WM_CLOSE, 0, 0);
+        }
+        else if (LOWORD(wParam) == ID_ACERCA) {
+            MessageBox(hWnd, _T("Autores:\nDiogo Ribeiro Costa - 2024143983\nRodrigo Cravo Pereira - 2024117439\nSO2 ISEC"), _T("Acerca"), MB_OK | MB_ICONINFORMATION);
+        }
+        else if (LOWORD(wParam) == ID_CONFIGURACAO) {
+            AbrirConfiguracao((HINSTANCE)GetWindowLongPtr(hWnd, GWLP_HINSTANCE));
+        }
+        break;
+    case WM_KEYDOWN:
+        if (wParam == VK_NEXT) {
+            if (pDados && hMutex) {
+                WaitForSingleObject(hMutex, INFINITE);
+                int total = pDados->num_alertas;
+                ReleaseMutex(hMutex);
+                int maxPaginas = (total > 0) ? ((total - 1) / maxAlertas) : 0;
+                if (paginaAtual < maxPaginas) {
+                    paginaAtual++;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+            }
+        }
+        else if (wParam == VK_PRIOR) {
+            if (paginaAtual > 0) {
+                paginaAtual--;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        }
+        break;
+    case WM_PAINT:
+    {
+        hdc = BeginPaint(hWnd, &ps);
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbmMem = CreateCompatibleBitmap(hdc, rcClient.right, rcClient.bottom);
+        HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbmMem);
+
+        HBRUSH hbrBg = CreateSolidBrush(RGB(245, 245, 250));
+        FillRect(hdcMem, &rcClient, hbrBg);
+        DeleteObject(hbrBg);
+
+        RECT rcHeader = rcClient;
+        rcHeader.bottom = 60;
+        HBRUSH hbrHeader = CreateSolidBrush(RGB(30, 60, 100));
+        FillRect(hdcMem, &rcHeader, hbrHeader);
+        DeleteObject(hbrHeader);
+
+        SetBkMode(hdcMem, TRANSPARENT);
+        SelectObject(hdcMem, hFontTitulo);
+        SetTextColor(hdcMem, RGB(255, 255, 255));
+        _stprintf_s(buffer, 512, _T("Plataforma de Alertas - Pagina %d"), paginaAtual + 1);
+        TextOut(hdcMem, 20, 12, buffer, (int)_tcslen(buffer));
+
+        if (pDados && hMutex) {
+            WaitForSingleObject(hMutex, INFINITE);
+            int totalAlertas = pDados->num_alertas;
+            int startIdx = paginaAtual * maxAlertas;
+
+            if (totalAlertas == 0) {
+                SelectObject(hdcMem, hFontNormal);
+                SetTextColor(hdcMem, RGB(100, 100, 100));
+                TextOut(hdcMem, 20, y, _T("Nenhum alerta ativo de momento."), 31);
+            }
+            else {
+                for (int i = startIdx; i < startIdx + maxAlertas && i < totalAlertas; i++) {
+                    RECT rcCard = { 20, y, rcClient.right - 20, y + 70 };
+                    HBRUSH hbrCard = CreateSolidBrush(RGB(255, 255, 255));
+                    HPEN hPenBorder = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+                    HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPenBorder);
+                    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdcMem, hbrCard);
+
+                    RoundRect(hdcMem, rcCard.left, rcCard.top, rcCard.right, rcCard.bottom, 10, 10);
+
+                    SelectObject(hdcMem, hOldBrush);
+                    SelectObject(hdcMem, hOldPen);
+                    DeleteObject(hbrCard);
+                    DeleteObject(hPenBorder);
+
+                    SelectObject(hdcMem, hFontBold);
+                    SetTextColor(hdcMem, RGB(80, 80, 80));
+                    _stprintf_s(buffer, 512, _T("Placar %lu  |  Restam %lu seg"), pDados->alertas[i].identificador, pDados->alertas[i].duracao);
+                    TextOut(hdcMem, 35, y + 10, buffer, (int)_tcslen(buffer));
+
+                    SelectObject(hdcMem, hFontNormal);
+                    SetTextColor(hdcMem, RGB(20, 20, 20));
+                    _stprintf_s(buffer, 512, _T("%s"), pDados->alertas[i].msg);
+                    TextOut(hdcMem, 35, y + 35, buffer, (int)_tcslen(buffer));
+
+                    y += 85;
+                }
+            }
+            ReleaseMutex(hMutex);
+        }
+        else {
+            SelectObject(hdcMem, hFontNormal);
+            SetTextColor(hdcMem, RGB(220, 50, 50));
+            TextOut(hdcMem, 20, y, _T("A aguardar ligacao ao Central..."), 32);
+        }
+
+        BitBlt(hdc, 0, 0, rcClient.right, rcClient.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbmMem);
+        DeleteDC(hdcMem);
+
+        EndPaint(hWnd, &ps);
+        break;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DESTROY:
+        DesligarRecursos();
+        DeleteObject(hFontTitulo);
+        DeleteObject(hFontNormal);
+        DeleteObject(hFontBold);
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    WNDCLASSEX wcex = { 0 };
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.lpfnWndProc = WndProc;
+    wcex.hInstance = hInstance;
+    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = NULL;
+    wcex.lpszClassName = _T("MonitorClass");
+    RegisterClassEx(&wcex);
+
+    hMainWindow = CreateWindow(_T("MonitorClass"), _T("Monitor de Alertas"), WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, NULL, NULL, hInstance, NULL);
+
+    LigarRecursos();
+    hThread = CreateThread(NULL, 0, ThreadMonitorUpdates, hMainWindow, 0, NULL);
+
+    ShowWindow(hMainWindow, nCmdShow);
+    UpdateWindow(hMainWindow);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return (int)msg.wParam;
 }

@@ -85,10 +85,19 @@ static BOOL GarantirNomePipeNoRegisto(const TCHAR* daLinhaComandos, TCHAR* nomeP
 
 static BOOL EscreverPipe(CONTEXTO_APP* ctx, const void* dados, DWORD tam) {
     DWORD escritos = 0;
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     EnterCriticalSection(&ctx->csPipe);
-    BOOL ok = WriteFile(ctx->hPipe, dados, tam, &escritos, NULL);
+    BOOL ok = WriteFile(ctx->hPipe, dados, tam, &escritos, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        WaitForSingleObject(ov.hEvent, INFINITE);
+        ok = GetOverlappedResult(ctx->hPipe, &ov, &escritos, FALSE);
+    }
     LeaveCriticalSection(&ctx->csPipe);
-    return ok && escritos == tam;
+
+    CloseHandle(ov.hEvent);
+    return ok && (escritos == tam);
 }
 
 static DWORD WINAPI ThreadAlertas(LPVOID param) {
@@ -172,11 +181,20 @@ static DWORD WINAPI ThreadReceberCentral(LPVOID param) {
     MSG_ID* mid;
     MSG_CMD conf;
 
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     for (;;) {
         if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
 
         lidos = 0;
-        ok = ReadFile(ctx->hPipe, buf, sizeof(buf), &lidos, NULL);
+        ok = ReadFile(ctx->hPipe, buf, sizeof(buf), &lidos, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE waits[2] = { ctx->eventoParar, ov.hEvent };
+            DWORD res = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+            if (res == WAIT_OBJECT_0) { CancelIo(ctx->hPipe); break; }
+            ok = GetOverlappedResult(ctx->hPipe, &ov, &lidos, FALSE);
+        }
 
         if (!ok || lidos == 0) {
             if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
@@ -267,7 +285,7 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 
         if (tam == 0) continue;
 
-        if (_tcsicmp(comando, _T("liga")) == 0) {
+        if (_tcsicmp(comando, _T("liga")) == 0 || _tcsicmp(comando, _T("ligar")) == 0) {
             if (InterlockedCompareExchange(&ctx->ligado, 0, 0) != 0) continue;
 
             cmd.tipo = TIPO_LIGAR;
@@ -285,7 +303,7 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
             PrintConsola(ctx, _T("Identificador = %lu\n"), ctx->identificador);
 
         }
-        else if (_tcsicmp(comando, _T("desliga")) == 0) {
+        else if (_tcsicmp(comando, _T("desliga")) == 0 || _tcsicmp(comando, _T("desligar")) == 0) {
             if (InterlockedCompareExchange(&ctx->ligado, 0, 0) == 0) {
                 InterlockedExchange(&ctx->deveSair, 1);
                 SetEvent(ctx->eventoParar);
@@ -336,7 +354,7 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     ligadoPipe = FALSE;
     for (tentativa = 0; tentativa < 5; tentativa++) {
-        ctx.hPipe = CreateFile(nomePipeCompleto, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        ctx.hPipe = CreateFile(nomePipeCompleto, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
         if (ctx.hPipe != INVALID_HANDLE_VALUE) {
             ligadoPipe = TRUE;
             break;

@@ -32,4 +32,17 @@ typedef struct {
     DWORD identificador;
 } MSG_ID;
 
+typedef struct {
+    DWORD identificador;
+    DWORD duracao;
+    TCHAR msg[140];
+    DWORD placares[20];
+} ALERTA_INFO;
+
+typedef struct {
+    ALERTA_INFO alertas[20];
+    int num_alertas;
+    BOOL desligar;
+} SHM_ALERTA;
+
 #endif

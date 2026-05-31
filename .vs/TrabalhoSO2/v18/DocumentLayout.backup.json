@@ -1,12 +1,71 @@
 {
   "Version": 1,
   "WorkspaceRootPath": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\",
-  "Documents": [],
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}|monitor\\monitor.vcxproj|C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\monitor\\monitor.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}|monitor\\monitor.vcxproj|solutionrelative:monitor\\monitor.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|central\\central.vcxproj|C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\central\\central.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|central\\central.vcxproj|solutionrelative:central\\central.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{B2C3D4E5-F6A7-8901-BCDE-F12345678901}|placar\\placar.vcxproj|C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\placar\\placar.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{B2C3D4E5-F6A7-8901-BCDE-F12345678901}|placar\\placar.vcxproj|solutionrelative:placar\\placar.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    }
+  ],
   "DocumentGroupContainers": [
     {
       "Orientation": 0,
       "VerticalTabListWidth": 256,
-      "DocumentGroups": []
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 2,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "central.c",
+              "DocumentMoniker": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\central\\central.c",
+              "RelativeDocumentMoniker": "central\\central.c",
+              "ToolTip": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\central\\central.c",
+              "RelativeToolTip": "central\\central.c",
+              "ViewState": "AgIAAC0CAAAAAAAAAAAAAFACAAABAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000423|",
+              "WhenOpened": "2026-05-31T16:11:12.482Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "placar.c",
+              "DocumentMoniker": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\placar\\placar.c",
+              "RelativeDocumentMoniker": "placar\\placar.c",
+              "ToolTip": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\placar\\placar.c",
+              "RelativeToolTip": "placar\\placar.c",
+              "ViewState": "AgIAABMBAAAAAAAAAAAAADEBAABjAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000423|",
+              "WhenOpened": "2026-05-31T16:08:32.28Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "monitor.c",
+              "DocumentMoniker": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\monitor\\monitor.c",
+              "RelativeDocumentMoniker": "monitor\\monitor.c",
+              "ToolTip": "C:\\Users\\user\\Documents\\uni\\so2\\TrabalhoSO2\\monitor\\monitor.c",
+              "RelativeToolTip": "monitor\\monitor.c",
+              "ViewState": "AgIAAP0AAAAAAAAAAAAhwCIBAAAeAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000423|",
+              "WhenOpened": "2026-05-31T15:35:50.088Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
     }
   ]
 }

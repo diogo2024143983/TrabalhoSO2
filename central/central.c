@@ -9,12 +9,19 @@
 #define TAM_MAX_COMANDO 512
 #define TAM_NOME_PIPE   256
 
+HANDLE hMapFileSHM;
+SHM_ALERTA* pDadosSHM;
+HANDLE hMutexSHM;
+HANDLE hEventSHM;
+
 typedef struct {
     BOOL   ativo;
     DWORD  identificador;
     HANDLE hPipe;
     BOOL   temAlerta;
     TCHAR  msgAlerta[TAM_MSG];
+    DWORD  duracaoInicial;
+    DWORD  tickInicio;
     CRITICAL_SECTION csPipe;
     HANDLE eventoConfirmacao;
 } ESTADO_PLACAR;
@@ -38,6 +45,42 @@ static void PrintConsola(CONTEXTO_APP* ctx, const TCHAR* fmt, ...) {
     va_end(args);
 }
 
+void AtualizarSHM(CONTEXTO_APP* ctx) {
+    int idx_shm = 0;
+    DWORD agora = GetTickCount();
+    WaitForSingleObject(hMutexSHM, INFINITE);
+    if (pDadosSHM) {
+        for (int i = 0; i < MAX_PLACAR; i++) {
+            if (ctx->placares[i].ativo && ctx->placares[i].temAlerta) {
+                pDadosSHM->alertas[idx_shm].identificador = ctx->placares[i].identificador;
+
+                DWORD decorrido = (agora - ctx->placares[i].tickInicio) / 1000;
+                if (ctx->placares[i].duracaoInicial > decorrido) {
+                    pDadosSHM->alertas[idx_shm].duracao = ctx->placares[i].duracaoInicial - decorrido;
+                }
+                else {
+                    pDadosSHM->alertas[idx_shm].duracao = 0;
+                }
+
+                _tcsncpy_s(pDadosSHM->alertas[idx_shm].msg, 140, ctx->placares[i].msgAlerta, _TRUNCATE);
+                idx_shm++;
+            }
+        }
+        pDadosSHM->num_alertas = idx_shm;
+    }
+    ReleaseMutex(hMutexSHM);
+    SetEvent(hEventSHM);
+}
+
+static DWORD WINAPI ThreadTimerSHM(LPVOID param) {
+    CONTEXTO_APP* ctx = (CONTEXTO_APP*)param;
+    while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
+        AtualizarSHM(ctx);
+        Sleep(1000);
+    }
+    return 0;
+}
+
 static int EncontrarPlacarPorId(CONTEXTO_APP* ctx, DWORD id) {
     int i;
     for (i = 0; i < MAX_PLACAR; i++) {
@@ -58,10 +101,19 @@ static int EncontrarSlotLivre(CONTEXTO_APP* ctx) {
 
 static BOOL EscreverPipePlacar(CONTEXTO_APP* ctx, int idx, const void* dados, DWORD tam) {
     DWORD escritos = 0;
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     EnterCriticalSection(&ctx->placares[idx].csPipe);
-    BOOL ok = WriteFile(ctx->placares[idx].hPipe, dados, tam, &escritos, NULL);
+    BOOL ok = WriteFile(ctx->placares[idx].hPipe, dados, tam, &escritos, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        WaitForSingleObject(ov.hEvent, INFINITE);
+        ok = GetOverlappedResult(ctx->placares[idx].hPipe, &ov, &escritos, FALSE);
+    }
     LeaveCriticalSection(&ctx->placares[idx].csPipe);
-    return ok && escritos == tam;
+
+    CloseHandle(ov.hEvent);
+    return ok && (escritos == tam);
 }
 
 static BOOL ParseDWORDStrict(const TCHAR* texto, DWORD* valorOut) {
@@ -98,13 +150,23 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
     BYTE tipo;
     DWORD id;
 
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     for (;;) {
         lidos = 0;
-        ok = ReadFile(hPipe, buf, sizeof(buf), &lidos, NULL);
+        ok = ReadFile(hPipe, buf, sizeof(buf), &lidos, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE waits[2] = { ctx->eventoParar, ov.hEvent };
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) { CancelIo(hPipe); break; }
+            ok = GetOverlappedResult(hPipe, &ov, &lidos, FALSE);
+        }
+
         if (!ok || lidos == 0) {
             PrintConsola(ctx, _T("[Central] Placar %lu desligou-se.\n"), ctx->placares[idx].identificador);
             break;
         }
+
         tipo = buf[0];
 
         if (tipo == TIPO_LIGAR) {
@@ -134,7 +196,7 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
             ctx->placares[idx].msgAlerta[0] = _T('\0');
             LeaveCriticalSection(&ctx->csPlacares);
             PrintConsola(ctx, _T("[Central] Alerta do placar %lu expirou.\n"), ctx->placares[idx].identificador);
-
+            AtualizarSHM(ctx);
         }
         else if (tipo == TIPO_NOVO_ALERTA) {
             SetEvent(ctx->placares[idx].eventoConfirmacao);
@@ -158,6 +220,9 @@ static DWORD WINAPI ThreadPlacar(LPVOID param) {
     ctx->placares[idx].msgAlerta[0] = _T('\0');
     LeaveCriticalSection(&ctx->csPlacares);
 
+    AtualizarSHM(ctx);
+    CloseHandle(ov.hEvent);
+
     return 0;
 }
 
@@ -175,29 +240,37 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
     while (InterlockedCompareExchange(&ctx->deveSair, 0, 0) == 0) {
         hPipe = CreateNamedPipe(
             nomePipeCompleto,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            MAX_PLACAR,
-            4096, 4096,
-            0, NULL
+            MAX_PLACAR, 4096, 4096, 0, NULL
         );
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
-            Sleep(500);
-            continue;
-        }
 
-        ligado = ConnectNamedPipe(hPipe, NULL);
-        if (!ligado && GetLastError() != ERROR_PIPE_CONNECTED) {
-            CloseHandle(hPipe);
-            if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) break;
-            continue;
-        }
+        if (hPipe == INVALID_HANDLE_VALUE) { Sleep(500); continue; }
 
-        if (InterlockedCompareExchange(&ctx->deveSair, 0, 0) != 0) {
-            CloseHandle(hPipe);
-            break;
+        OVERLAPPED ovConn = { 0 };
+        ovConn.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        ligado = ConnectNamedPipe(hPipe, &ovConn);
+
+        if (!ligado) {
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                HANDLE waits[2] = { ctx->eventoParar, ovConn.hEvent };
+                if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
+                    CancelIo(hPipe);
+                    CloseHandle(hPipe);
+                    CloseHandle(ovConn.hEvent);
+                    break;
+                }
+                DWORD dummy;
+                ligado = GetOverlappedResult(hPipe, &ovConn, &dummy, FALSE);
+            }
+            else if (err == ERROR_PIPE_CONNECTED) {
+                ligado = TRUE;
+            }
         }
+        CloseHandle(ovConn.hEvent);
+
+        if (!ligado) { CloseHandle(hPipe); continue; }
 
         EnterCriticalSection(&ctx->csPlacares);
         slot = EncontrarSlotLivre(ctx);
@@ -215,27 +288,10 @@ static DWORD WINAPI ThreadAceitarLigacoes(LPVOID param) {
         LeaveCriticalSection(&ctx->csPlacares);
 
         args = (ARGS_THREAD_PLACAR*)malloc(sizeof(ARGS_THREAD_PLACAR));
-        if (args == NULL) {
-            EnterCriticalSection(&ctx->csPlacares);
-            ctx->placares[slot].ativo = FALSE;
-            ctx->placares[slot].hPipe = NULL;
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
         args->ctx = ctx;
         args->idx = slot;
 
         hThread = CreateThread(NULL, 0, ThreadPlacar, args, 0, NULL);
-        if (hThread == NULL) {
-            free(args);
-            EnterCriticalSection(&ctx->csPlacares);
-            ctx->placares[slot].ativo = FALSE;
-            ctx->placares[slot].hPipe = NULL;
-            LeaveCriticalSection(&ctx->csPlacares);
-            CloseHandle(hPipe);
-            continue;
-        }
         CloseHandle(hThread);
     }
     return 0;
@@ -295,9 +351,12 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
             if (ctx->placares[destinos[i]].ativo) {
                 ctx->placares[destinos[i]].temAlerta = TRUE;
                 _tcsncpy_s(ctx->placares[destinos[i]].msgAlerta, TAM_MSG, msg, _TRUNCATE);
+                ctx->placares[destinos[i]].duracaoInicial = duracao;
+                ctx->placares[destinos[i]].tickInicio = GetTickCount();
             }
             LeaveCriticalSection(&ctx->csPlacares);
         }
+        AtualizarSHM(ctx);
     }
     else {
         int idx = EncontrarPlacarPorId(ctx, idPlacar);
@@ -313,8 +372,11 @@ static void CmdAlerta(CONTEXTO_APP* ctx, TCHAR* args) {
             if (ctx->placares[idx].ativo) {
                 ctx->placares[idx].temAlerta = TRUE;
                 _tcsncpy_s(ctx->placares[idx].msgAlerta, TAM_MSG, msg, _TRUNCATE);
+                ctx->placares[idx].duracaoInicial = duracao;
+                ctx->placares[idx].tickInicio = GetTickCount();
             }
             LeaveCriticalSection(&ctx->csPlacares);
+            AtualizarSHM(ctx);
         }
         else {
             LeaveCriticalSection(&ctx->csPlacares);
@@ -349,6 +411,7 @@ static void CmdCancelar(CONTEXTO_APP* ctx, TCHAR* args) {
             ctx->placares[idx].msgAlerta[0] = _T('\0');
         }
         LeaveCriticalSection(&ctx->csPlacares);
+        AtualizarSHM(ctx);
     }
     else {
         LeaveCriticalSection(&ctx->csPlacares);
@@ -388,6 +451,11 @@ static void CmdEncerrar(CONTEXTO_APP* ctx) {
         EscreverPipePlacar(ctx, i, &cmd, sizeof(MSG_CMD));
     }
     LeaveCriticalSection(&ctx->csPlacares);
+
+    WaitForSingleObject(hMutexSHM, INFINITE);
+    if (pDadosSHM) pDadosSHM->desligar = TRUE;
+    ReleaseMutex(hMutexSHM);
+    SetEvent(hEventSHM);
 
     SetEvent(ctx->eventoParar);
 }
@@ -441,10 +509,16 @@ static DWORD WINAPI ThreadComandos(LPVOID param) {
 
 int _tmain(int argc, TCHAR* argv[]) {
     CONTEXTO_APP ctx;
-    HANDLE hThreadLigacoes, hThreadCmds;
+    HANDLE hThreadLigacoes, hThreadCmds, hThreadTimerSHM;
     int i;
 
     if (argc < 2 || argv[1] == NULL || argv[1][0] == _T('\0')) return 1;
+
+    hMapFileSHM = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SHM_ALERTA), _T("Local\\SO2_SHM"));
+    if (hMapFileSHM) pDadosSHM = (SHM_ALERTA*)MapViewOfFile(hMapFileSHM, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SHM_ALERTA));
+    hMutexSHM = CreateMutex(NULL, FALSE, _T("Local\\SO2_MUTEX"));
+    hEventSHM = CreateEvent(NULL, TRUE, FALSE, _T("Local\\SO2_EVENT"));
+    if (pDadosSHM) pDadosSHM->desligar = FALSE;
 
     ZeroMemory(&ctx, sizeof(ctx));
     _tcsncpy_s(ctx.nomePipe, _countof(ctx.nomePipe), argv[1], _TRUNCATE);
@@ -472,6 +546,9 @@ int _tmain(int argc, TCHAR* argv[]) {
     hThreadLigacoes = CreateThread(NULL, 0, ThreadAceitarLigacoes, &ctx, 0, NULL);
     if (hThreadLigacoes == NULL) return 1;
 
+    hThreadTimerSHM = CreateThread(NULL, 0, ThreadTimerSHM, &ctx, 0, NULL);
+    if (hThreadTimerSHM == NULL) return 1;
+
     hThreadCmds = CreateThread(NULL, 0, ThreadComandos, &ctx, 0, NULL);
     if (hThreadCmds == NULL) {
         InterlockedExchange(&ctx.deveSair, 1);
@@ -485,9 +562,11 @@ int _tmain(int argc, TCHAR* argv[]) {
     InterlockedExchange(&ctx.deveSair, 1);
     SetEvent(ctx.eventoParar);
     WaitForSingleObject(hThreadLigacoes, 3000);
+    WaitForSingleObject(hThreadTimerSHM, 3000);
 
     CloseHandle(hThreadCmds);
     CloseHandle(hThreadLigacoes);
+    CloseHandle(hThreadTimerSHM);
     CloseHandle(ctx.eventoParar);
 
     EnterCriticalSection(&ctx.csPlacares);
@@ -504,5 +583,11 @@ int _tmain(int argc, TCHAR* argv[]) {
 
     DeleteCriticalSection(&ctx.csPlacares);
     DeleteCriticalSection(&ctx.csConsola);
+
+    if (pDadosSHM) UnmapViewOfFile(pDadosSHM);
+    if (hMapFileSHM) CloseHandle(hMapFileSHM);
+    if (hMutexSHM) CloseHandle(hMutexSHM);
+    if (hEventSHM) CloseHandle(hEventSHM);
+
     return 0;
 }
