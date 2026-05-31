@@ -11,6 +11,8 @@
 #define IDC_MUTEX_NAME 2003
 #define IDC_EVENT_NAME 2004
 #define IDC_BTN_OK 2005
+#define IDC_BTN_PREV 2006
+#define IDC_BTN_NEXT 2007
 
 HANDLE hMapFile = NULL;
 SHM_ALERTA* pDados = NULL;
@@ -22,6 +24,8 @@ int maxAlertas = 5;
 int paginaAtual = 0;
 HWND hMainWindow;
 HWND hConfigWindow = NULL;
+HWND hBtnPrev = NULL;
+HWND hBtnNext = NULL;
 
 TCHAR nomeSHM[256] = _T("Local\\SO2_SHM");
 TCHAR nomeMutex[256] = _T("Local\\SO2_MUTEX");
@@ -143,6 +147,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         hFontTitulo = CreateFont(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
         hFontNormal = CreateFont(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
         hFontBold = CreateFont(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
+
+        hBtnPrev = CreateWindow(_T("BUTTON"), _T("< Anterior (PgUp)"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 480, 15, 140, 30, hWnd, (HMENU)IDC_BTN_PREV, NULL, NULL);
+        hBtnNext = CreateWindow(_T("BUTTON"), _T("Seguinte (PgDn) >"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 630, 15, 140, 30, hWnd, (HMENU)IDC_BTN_NEXT, NULL, NULL);
+
+        SendMessage(hBtnPrev, WM_SETFONT, (WPARAM)hFontBold, TRUE);
+        SendMessage(hBtnNext, WM_SETFONT, (WPARAM)hFontBold, TRUE);
     }
     break;
     case WM_COMMAND:
@@ -154,6 +164,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         else if (LOWORD(wParam) == ID_CONFIGURACAO) {
             AbrirConfiguracao((HINSTANCE)GetWindowLongPtr(hWnd, GWLP_HINSTANCE));
+        }
+        else if (LOWORD(wParam) == IDC_BTN_PREV) {
+            SendMessage(hWnd, WM_KEYDOWN, VK_PRIOR, 0);
+            SetFocus(hWnd);
+        }
+        else if (LOWORD(wParam) == IDC_BTN_NEXT) {
+            SendMessage(hWnd, WM_KEYDOWN, VK_NEXT, 0);
+            SetFocus(hWnd);
         }
         break;
     case WM_KEYDOWN:
@@ -281,7 +299,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcex.lpszClassName = _T("MonitorClass");
     RegisterClassEx(&wcex);
 
-    hMainWindow = CreateWindow(_T("MonitorClass"), _T("Monitor de Alertas"), WS_OVERLAPPEDWINDOW,
+    hMainWindow = CreateWindow(_T("MonitorClass"), _T("Monitor de Alertas"), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, NULL, NULL, hInstance, NULL);
 
     LigarRecursos();

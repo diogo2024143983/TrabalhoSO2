@@ -1,87 +1,38 @@
-SO2 - Trabalho Laboratorial - M2
+SO2 - Trabalho Laboratorial - M3
 =================================
+Identificacao do Grupo
+Diogo Ribeiro Costa - 2024143983
+Rodrigo Cravo Pereira - 2024117439
+
+Declaracao de Defesa Oral
+Nao pretendemos realizar a defesa oral, individual e presencial, do trabalho laboratorial. Submetemos o projeto exclusivamente para a avaliacao funcional base (2.5 valores). O relatorio detalhado foi, por isso, omitido da submissao.
 
 Estrutura do projeto
---------------------
-  TrabalhoSO2.sln        - Solucao Visual Studio 2022 (agrupa central e placar)
-  central\
-    central.c            - Codigo fonte do programa central
-    central.vcxproj      - Projeto VS do central
-  placar\
-    placar.c             - Codigo fonte do programa placar
-    placar.vcxproj       - Projeto VS do placar
-  compilar.bat           - Script de compilacao rapida (MSBuild)
-  readme.txt             - Este ficheiro
+TrabalhoSO2.sln        - Solucao Visual Studio 2022
+central\               - Codigo fonte e projeto do programa central
+monitor\               - Codigo fonte e projeto do programa monitor (Win32 GUI)
+protocolo.h            - Estruturas de dados, Named Pipes e Memoria Partilhada
+readme.txt             - Este ficheiro
 
 Compilacao
-----------
-  Opcao 1 - Abrir TrabalhoSO2.sln no Visual Studio 2022 e compilar (Ctrl+Shift+B)
+Abrir TrabalhoSO2.sln no Visual Studio 2022.
+Selecionar "Build" -> "Build Solution" (Ctrl+Shift+B).
+Os executaveis serao compilados nas respetivas diretorias x64\Debug de cada projeto.
 
-  Opcao 2 - Executar compilar.bat (nao precisa de Developer Command Prompt):
-    compilar.bat
-    Os executaveis ficam em: x64\Debug\central.exe e x64\Debug\placar.exe
+Requisitos Implementados na M3 (Entrega Final)
+[x] Monitor desenvolvido com Interface Grafica nativa (API Win32).
+[x] Comunicacao unidirecional Central -> Monitor estabelecida por Memoria Partilhada.
+[x] Sincronizacao de acessos a Memoria Partilhada protegida rigorosamente por Mutex.
+[x] Notificacao de atualizacoes baseada em Eventos do Windows (ausencia total de polling).
+[x] DialogBox de Configuracao (definicao do limite de alertas por pagina e reconfiguracao dos nomes IPC).
+[x] MessageBox "Acerca" com a identificacao dos autores.
+[x] Paginacao do conteudo na interface atraves das teclas Page Up / Page Down e botoes na UI.
+[x] Thread de timer na Central para atualizacao constante do tempo decrescente e injecao na SHM.
+[x] Encerramento coordenado: a Central instrui a finalizacao do processo Monitor no fecho.
 
-  Opcao 3 - Developer Command Prompt do VS2022 manualmente:
-    cd central
-    cl /W3 /TC /D_UNICODE /DUNICODE central.c /Fe:central.exe /link advapi32.lib
-    cd ..\placar
-    cl /W3 /TC /D_UNICODE /DUNICODE placar.c /Fe:placar.exe /link advapi32.lib
-
-Utilizacao
-----------
-  1. Iniciar o central (numa consola):
-       central.exe tubo
-     O central fica a escutar no named pipe \\.\pipe\tubo
-
-  2. Iniciar um ou mais placares (cada um numa consola separada):
-       placar.exe tubo
-     O placar liga-se ao central via \\.\pipe\tubo.
-     Se o nome do pipe ja estiver guardado no Registry, pode omitir o argumento:
-       placar.exe
-
-  3. No placar, escrever:
-       ligar     -> regista o placar no central e recebe o identificador
-       desligar  -> remove o placar da plataforma e termina
-
-  4. No central, escrever:
-       alerta <msg> <duracao_seg> <id_placar>
-                 -> envia alerta ao placar indicado (id=0 envia a todos)
-                 Exemplo: alerta A7 Norte - Acidente Km 34 300 1
-       cancelar <id_placar>
-                 -> cancela o alerta ativo no placar indicado
-       listar    -> lista todos os placares ligados e alertas ativos
-       encerrar  -> encerra a plataforma (notifica todos os placares)
-
-Requisitos implementados - M2
-------------------------------
-Central:
-  [x] 1. Recebe nome do pipe via linha de comandos (central.exe tubo -> \\.\pipe\tubo)
-  [x] 2. Comando "alerta": envia MSG_ALERTA (tipo=4) ao(s) placar(es) e aguarda confirmacao
-  [x] 2. Comando "cancelar": envia MSG_CMD (tipo=5) ao placar e aguarda confirmacao
-  [x] 2. Comando "listar": mostra placares ligados e alertas ativos
-  [x] 2. Comando "encerrar": envia MSG_CMD (tipo=6) a todos os placares
-  [x] 3. Processa MSG_CMD tipo=1 (ligar): responde com MSG_ID (tipo=7)
-  [x] 3. Processa MSG_CMD tipo=2 (desligar): responde com MSG_CMD (tipo=2)
-  [x] 3. Processa MSG_CMD tipo=3 (fim alerta): atualiza estado interno
-  [x] 4. Mantem estado dos placares, alertas ativos e identificadores
-
-Placar (alteracoes M2):
-  [x] 5. Comando "ligar": envia MSG_CMD (tipo=1), recebe MSG_ID (tipo=7), mostra identificador
-  [x] 6. Comando "desligar": envia MSG_CMD (tipo=2), recebe confirmacao, termina
-  [x] 7. Timer expirado: envia MSG_CMD (tipo=3) ao central
-  [x] 8. Recebe MSG_ALERTA (tipo=4): confirma com mesma estrutura, mostra na consola com timestamp
-  [x] 9. Recebe MSG_CMD (tipo=5): confirma, mostra "---" com timestamp
-  [x] 10. Recebe MSG_CMD (tipo=6): termina a execucao
-
-Notas de implementacao
-----------------------
-- Named pipe bidirecional em modo MESSAGE (PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE)
-- O central cria uma thread por placar ligado (ThreadPlacar) que e a unica a ler do pipe
-  desse placar, evitando race conditions nas leituras
-- As confirmacoes de alerta/cancelar sao sinalizadas via eventos auto-reset da ThreadPlacar
-  para a thread de comandos do administrador (sem ReadFile concorrente)
-- O placar tem uma thread dedicada a receber mensagens do central (ThreadReceberCentral),
-  que e a unica a ler do pipe, e comunica com as outras threads via eventos auto-reset
-- Sincronizacao: CRITICAL_SECTION para escritas no pipe e para o array de placares;
-  eventos auto-reset para sincronizacao entre threads
-- O nome do pipe e guardado no Registry em HKCU\Software\TrabSO2\NPIPE (REG_SZ)
+Requisitos Consolidados (M1 e M2)
+[x] Comunicacao assincrona (Overlapped I/O) bidirecional por Named Pipes (Central <-> Placar).
+[x] Central multiprocesso: suporta e comunica em tempo real com multiplas instancias do Placar em simultaneo.
+[x] Tratamento de duracao de alertas locais garantido por Waitable Timers.
+[x] Leitura estrita de identificadores e persistencia no Registry do Windows.
+[x] Interfaces de controlo CLI por comandos assincronos na Central e no Placar.
